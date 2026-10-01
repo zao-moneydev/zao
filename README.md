@@ -1,7 +1,3 @@
-# zao
-Zao is a decentralized micro-lending protocol on Stellar that gives unbanked individuals and informal traders access to fair, fast, and affordable credit through group-backed loans, USDC disbursement, and anchor cash-out. Currently seeking funding to build the MVP.
-
-
 # Zao
 
 **Community-based lending on Stellar.**
