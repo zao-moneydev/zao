@@ -1,0 +1,23 @@
+# Rust
+target
+
+# Stellar CLI
+.soroban
+.stellar
+
+# Node
+node_modules
+dist
+backend/data
+*.db
+
+# Secrets — never commit
+.env
+.env.local
+backend/.env
+client/.env
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.bak
