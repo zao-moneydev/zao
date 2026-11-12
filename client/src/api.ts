@@ -70,10 +70,26 @@ export const api = {
       method: "POST",
     }),
   disburse: (groupId: number) =>
-    request<{ tx: Tx }>(`/api/loans/${groupId}/disburse`, { method: "POST" }),
+    request<{ tx: Tx; gate?: { reason: string }; kycOnchain?: { hash: string | null; expert: string | null } }>(
+      `/api/loans/${groupId}/disburse`,
+      { method: "POST" },
+    ),
+  gate: (groupId: number) =>
+    request<{
+      allowed: boolean;
+      reason: string;
+      code: string;
+      kycStatus: string;
+      onchainKyc: boolean;
+      amlMaxAmount: string;
+    }>(`/api/loans/${groupId}/gate`),
   repay: (groupId: number) => request<{ tx: Tx }>(`/api/loans/${groupId}/repay`, { method: "POST" }),
   kyc: (fields: Record<string, string>) =>
-    request<{ status: string }>("/api/anchor/kyc", { method: "POST", body: JSON.stringify(fields) }),
+    request<{ status: string; kycOnchain?: { hash: string | null; expert: string | null } }>("/api/anchor/kyc", {
+      method: "POST",
+      body: JSON.stringify(fields),
+    }),
+  kycStatus: () => request<{ status: string }>("/api/anchor/kyc"),
   withdraw: (amount: string) =>
     request<{ url: string; id: string }>("/api/anchor/withdraw", {
       method: "POST",

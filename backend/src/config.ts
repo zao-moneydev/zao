@@ -32,6 +32,14 @@ export const config = {
   /** Credit asset the configured anchor lists (SRT on testanchor; USDC if present). */
   anchorAssetCode: process.env.ANCHOR_ASSET_CODE ?? "SRT",
   e2eMintUsdc: (process.env.E2E_MINT_USDC ?? "false") === "true",
+  supabaseUrl: process.env.SUPABASE_URL ?? "",
+  supabaseAnonKey:
+    process.env.SUPABASE_ANON_KEY ?? process.env.SUPABASE_PUBLISHABLE_KEY ?? "",
+  databaseUrl: process.env.DATABASE_URL ?? process.env.SUPABASE_DB_URL ?? "",
+  /** Human units of the pool asset (e.g. 1000 SRT). Disburse above this is AML-blocked. */
+  amlMaxAmount: process.env.AML_MAX_AMOUNT ?? "1000",
+  /** Comma-separated Stellar public keys. */
+  amlDenylist: process.env.AML_DENYLIST ?? "",
 };
 
 export type TestnetConfig = {

@@ -2,8 +2,9 @@ import { randomUUID } from "node:crypto";
 import { Router } from "express";
 import { z } from "zod";
 import { config, expertAccount, loadTestnetConfig } from "./config.ts";
-import { db, publicUser, type UserRow } from "./db.ts";
+import { db, dbDriver, publicUser, type UserRow } from "./db.ts";
 import { LOAN_TERM_SECONDS } from "./jobs.ts";
+import { evaluateDisburseGate, parseDenylist } from "./kyc-gate.ts";
 import { log } from "./log.ts";
 import {
   sep10,
@@ -20,6 +21,7 @@ import {
 } from "./sep.ts";
 import {
   contracts,
+  deployerKeypair,
   dueAmount,
   ensureTrustline,
   fundAccount,
@@ -56,21 +58,21 @@ function asyncHandler(
 type expressReq = import("express").Request;
 type expressRes = import("express").Response;
 
-function userByToken(req: expressReq): UserRow {
+async function userByToken(req: expressReq): Promise<UserRow> {
   const header = req.header("authorization") ?? "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : (req.header("x-session-token") ?? "");
   if (!token) throw new HttpError(401, "missing session token");
-  const session = db.prepare("SELECT user_id FROM sessions WHERE token = ?").get(token) as
+  const session = (await db.prepare("SELECT user_id FROM sessions WHERE token = ?").get(token)) as
     | { user_id: string }
     | undefined;
   if (!session) throw new HttpError(401, "invalid session");
-  const user = db.prepare("SELECT * FROM users WHERE id = ?").get(session.user_id) as UserRow | undefined;
+  const user = (await db.prepare("SELECT * FROM users WHERE id = ?").get(session.user_id)) as UserRow | undefined;
   if (!user) throw new HttpError(401, "user not found");
   return user;
 }
 
-function userById(id: string): UserRow {
-  const user = db.prepare("SELECT * FROM users WHERE id = ?").get(id) as UserRow | undefined;
+async function userById(id: string): Promise<UserRow> {
+  const user = (await db.prepare("SELECT * FROM users WHERE id = ?").get(id)) as UserRow | undefined;
   if (!user) throw new HttpError(404, `user ${id} not found`);
   return user;
 }
@@ -82,13 +84,81 @@ function routeParam(req: expressReq, name: string): string {
   return raw;
 }
 
-function requireKyc(user: UserRow, action: string) {
-  if (user.kyc_status !== "ACCEPTED") {
-    throw new HttpError(
-      403,
-      `KYC/AML gate: ${action} blocked until the anchor reports ACCEPTED (current: ${user.kyc_status})`,
+async function writeGateAudit(row: {
+  userId?: string | null;
+  publicKey?: string | null;
+  action: string;
+  kycStatus?: string | null;
+  amount?: string | null;
+  allowed: boolean;
+  reason: string;
+  code?: string | null;
+  groupId?: number | null;
+  loanId?: number | null;
+}) {
+  await db
+    .prepare(
+      `INSERT INTO gate_audit (at, user_id, public_key, action, kyc_status, amount, allowed, reason, code, group_id, loan_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      Date.now(),
+      row.userId ?? null,
+      row.publicKey ?? null,
+      row.action,
+      row.kycStatus ?? null,
+      row.amount ?? null,
+      row.allowed ? 1 : 0,
+      row.reason,
+      row.code ?? null,
+      row.groupId ?? null,
+      row.loanId ?? null,
     );
+  log.info("KYC/AML gate", {
+    action: row.action,
+    allowed: row.allowed,
+    code: row.code,
+    kycStatus: row.kycStatus,
+    publicKey: row.publicKey,
+    reason: row.reason,
+  });
+}
+
+async function refreshSep12(user: UserRow): Promise<UserRow> {
+  if (!user.kyc_id && user.kyc_status === "NEEDS_INFO") return user;
+  try {
+    const kp = keypairFromEncrypted(user.secret_enc);
+    const token = await sep10(kp);
+    const got = await sep12Get(token, user.public_key, user.kyc_id);
+    await db
+      .prepare("UPDATE users SET kyc_status = ?, kyc_id = ? WHERE id = ?")
+      .run(got.status, got.id ?? user.kyc_id, user.id);
+    return { ...user, kyc_status: got.status, kyc_id: got.id ?? user.kyc_id };
+  } catch (err) {
+    log.error("SEP-12 refresh failed", { publicKey: user.public_key, err: String(err) });
+    return user;
   }
+}
+
+async function approveLeaderOnchain(leaderPublicKey: string) {
+  const cfg = requireContracts();
+  const admin = deployerKeypair();
+  const already = await readContract({
+    contractId: cfg.lendingPoolContractId,
+    method: "is_kyc_approved",
+    args: [leaderPublicKey],
+    source: admin,
+  });
+  if (already === true) {
+    return { hash: null as string | null, expert: null as string | null, already: true };
+  }
+  const tx = await invoke({
+    contractId: cfg.lendingPoolContractId,
+    method: "set_kyc_approved",
+    args: [admin.publicKey(), leaderPublicKey, true],
+    source: admin,
+  });
+  return { hash: tx.hash, expert: tx.expert, already: false };
 }
 
 function requireContracts() {
@@ -149,11 +219,11 @@ function publicError(err: unknown): { status: number; message: string } {
 }
 
 async function createUser(name: string, email: string): Promise<{ user: ReturnType<typeof publicUser>; token: string }> {
-  const existing = db.prepare("SELECT id FROM users WHERE email = ?").get(email);
+  const existing = await db.prepare("SELECT id FROM users WHERE email = ?").get(email);
   if (existing) throw new HttpError(409, "That email is already registered. Sign in instead.");
   const wallet = createInvisibleWallet();
   const id = randomUUID();
-  db.prepare(
+  await db.prepare(
     `INSERT INTO users (id, email, name, public_key, secret_enc, kyc_status, created_at)
      VALUES (?, ?, ?, ?, ?, 'NEEDS_INFO', ?)`,
   ).run(id, email, name, wallet.publicKey, wallet.secretEnc, Date.now());
@@ -163,12 +233,12 @@ async function createUser(name: string, email: string): Promise<{ user: ReturnTy
     log.error("friendbot funding failed", { publicKey: wallet.publicKey, err: String(err) });
   }
   const token = randomSessionToken();
-  db.prepare("INSERT INTO sessions (token, user_id, created_at) VALUES (?, ?, ?)").run(
+  await db.prepare("INSERT INTO sessions (token, user_id, created_at) VALUES (?, ?, ?)").run(
     token,
     id,
     Date.now(),
   );
-  const user = db.prepare("SELECT * FROM users WHERE id = ?").get(id) as UserRow;
+  const user = await db.prepare("SELECT * FROM users WHERE id = ?").get(id) as UserRow;
   return { user: publicUser(user), token };
 }
 
@@ -178,6 +248,9 @@ api.get("/health", (_req, res) => {
     ok: true,
     network: config.network,
     anchor: config.anchorHomeDomain,
+    db: dbDriver,
+    supabase: config.supabaseUrl || null,
+    amlMaxAmount: config.amlMaxAmount,
     contracts: {
       lendingPool: cfg.lendingPoolContractId,
       reputation: cfg.reputationContractId,
@@ -223,10 +296,10 @@ api.post(
   "/users/login",
   asyncHandler(async (req, res) => {
     const body = z.object({ email: z.string().email() }).parse(req.body);
-    const user = db.prepare("SELECT * FROM users WHERE email = ?").get(body.email) as UserRow | undefined;
+    const user = await db.prepare("SELECT * FROM users WHERE email = ?").get(body.email) as UserRow | undefined;
     if (!user) throw new HttpError(404, "user not found");
     const token = randomSessionToken();
-    db.prepare("INSERT INTO sessions (token, user_id, created_at) VALUES (?, ?, ?)").run(
+    await db.prepare("INSERT INTO sessions (token, user_id, created_at) VALUES (?, ?, ?)").run(
       token,
       user.id,
       Date.now(),
@@ -238,7 +311,7 @@ api.post(
 api.get(
   "/users/me",
   asyncHandler(async (req, res) => {
-    const user = userByToken(req);
+    const user = await userByToken(req);
     res.json({
       user: publicUser(user),
       explorer: expertAccount(user.public_key),
@@ -249,7 +322,7 @@ api.get(
 api.get(
   "/users",
   asyncHandler(async (_req, res) => {
-    const rows = db.prepare("SELECT * FROM users ORDER BY created_at").all() as UserRow[];
+    const rows = await db.prepare("SELECT * FROM users ORDER BY created_at").all() as UserRow[];
     res.json({ users: rows.map(publicUser) });
   }),
 );
@@ -257,7 +330,7 @@ api.get(
 api.post(
   "/groups",
   asyncHandler(async (req, res) => {
-    const me = userByToken(req);
+    const me = await userByToken(req);
     const body = z
       .object({
         memberIds: z.array(z.string()).min(2).max(4),
@@ -267,7 +340,7 @@ api.post(
     if (ids.length < 3 || ids.length > 5) {
       throw new HttpError(400, "groups must have 3–5 unique members including the leader");
     }
-    const members = ids.map(userById);
+    const members = await Promise.all(ids.map((id) => userById(id)));
     const cfg = requireContracts();
     const leaderKp = keypairFromEncrypted(me.secret_enc);
     const result = await invoke({
@@ -277,7 +350,7 @@ api.post(
       source: leaderKp,
     });
     const onchainId = Number(result.returnValue);
-    const info = db
+    const info = await db
       .prepare(
         `INSERT INTO groups (onchain_id, leader_id, member_ids, create_tx, created_at)
          VALUES (?, ?, ?, ?, ?)`,
@@ -296,7 +369,7 @@ api.post(
 api.get(
   "/groups",
   asyncHandler(async (_req, res) => {
-    const rows = db.prepare("SELECT * FROM groups ORDER BY id DESC").all() as Array<{
+    const rows = await db.prepare("SELECT * FROM groups ORDER BY id DESC").all() as Array<{
       id: number;
       onchain_id: number;
       leader_id: string;
@@ -304,20 +377,22 @@ api.get(
       create_tx: string;
       created_at: number;
     }>;
-    const users = db.prepare("SELECT * FROM users").all() as UserRow[];
+    const users = await db.prepare("SELECT * FROM users").all() as UserRow[];
     const byId = new Map(users.map((u) => [u.id, publicUser(u)]));
-    const groups = rows.map((row) => {
-      const memberIds = JSON.parse(row.member_ids) as string[];
-      const loan = db
-        .prepare("SELECT * FROM loans WHERE group_id = ? ORDER BY id DESC LIMIT 1")
-        .get(row.id);
-      return {
-        ...row,
-        memberIds,
-        members: memberIds.map((id) => byId.get(id)).filter(Boolean),
-        loan: loan ?? null,
-      };
-    });
+    const groups = await Promise.all(
+      rows.map(async (row) => {
+        const memberIds = JSON.parse(row.member_ids) as string[];
+        const loan = await db
+          .prepare("SELECT * FROM loans WHERE group_id = ? ORDER BY id DESC LIMIT 1")
+          .get(row.id);
+        return {
+          ...row,
+          memberIds,
+          members: memberIds.map((id) => byId.get(id)).filter(Boolean),
+          loan: loan ?? null,
+        };
+      }),
+    );
     res.json({ groups });
   }),
 );
@@ -325,9 +400,9 @@ api.get(
 api.get(
   "/groups/:id",
   asyncHandler(async (req, res) => {
-    const group = db.prepare("SELECT * FROM groups WHERE id = ?").get(Number(req.params.id));
+    const group = await db.prepare("SELECT * FROM groups WHERE id = ?").get(Number(req.params.id));
     if (!group) throw new HttpError(404, "group not found");
-    const loan = db
+    const loan = await db
       .prepare("SELECT * FROM loans WHERE group_id = ? ORDER BY id DESC LIMIT 1")
       .get(Number(req.params.id));
     res.json({ group, loan: loan ?? null });
@@ -337,14 +412,14 @@ api.get(
 api.post(
   "/loans",
   asyncHandler(async (req, res) => {
-    const me = userByToken(req);
+    const me = await userByToken(req);
     const body = z
       .object({
         groupId: z.number().int(),
         amount: z.string().or(z.number()),
       })
       .parse(req.body);
-    const group = db.prepare("SELECT * FROM groups WHERE id = ?").get(body.groupId) as
+    const group = await db.prepare("SELECT * FROM groups WHERE id = ?").get(body.groupId) as
       | { id: number; onchain_id: number; leader_id: string; member_ids: string }
       | undefined;
     if (!group) throw new HttpError(404, "group not found");
@@ -360,7 +435,7 @@ api.post(
       source: keypairFromEncrypted(me.secret_enc),
     });
     const onchainId = Number(result.returnValue);
-    const info = db
+    const info = await db
       .prepare(
         `INSERT INTO loans (group_id, onchain_id, principal, due_amount, status, signatures, request_tx, created_at)
          VALUES (?, ?, ?, ?, 'REQUESTED', '[]', ?, ?)`,
@@ -379,15 +454,15 @@ api.post(
 api.post(
   "/loans/:groupId/sign",
   asyncHandler(async (req, res) => {
-    const me = userByToken(req);
+    const me = await userByToken(req);
     const groupId = Number(req.params.groupId);
-    const group = db.prepare("SELECT * FROM groups WHERE id = ?").get(groupId) as
+    const group = await db.prepare("SELECT * FROM groups WHERE id = ?").get(groupId) as
       | { id: number; onchain_id: number; member_ids: string }
       | undefined;
     if (!group) throw new HttpError(404, "group not found");
     const members: string[] = JSON.parse(group.member_ids);
     if (!members.includes(me.id)) throw new HttpError(403, "not a group member");
-    const loan = db
+    const loan = await db
       .prepare("SELECT * FROM loans WHERE group_id = ? ORDER BY id DESC LIMIT 1")
       .get(groupId) as { id: number; signatures: string } | undefined;
     if (!loan) throw new HttpError(404, "loan not found");
@@ -400,7 +475,7 @@ api.post(
     });
     const signatures: string[] = JSON.parse(loan.signatures);
     if (!signatures.includes(me.id)) signatures.push(me.id);
-    db.prepare("UPDATE loans SET signatures = ? WHERE id = ?").run(JSON.stringify(signatures), loan.id);
+    await db.prepare("UPDATE loans SET signatures = ? WHERE id = ?").run(JSON.stringify(signatures), loan.id);
     res.json({ signatures, tx: result });
   }),
 );
@@ -408,15 +483,15 @@ api.post(
 api.post(
   "/loans/:groupId/sign-all",
   asyncHandler(async (req, res) => {
-    const me = userByToken(req);
+    const me = await userByToken(req);
     const groupId = Number(req.params.groupId);
-    const group = db.prepare("SELECT * FROM groups WHERE id = ?").get(groupId) as
+    const group = await db.prepare("SELECT * FROM groups WHERE id = ?").get(groupId) as
       | { id: number; onchain_id: number; member_ids: string }
       | undefined;
     if (!group) throw new HttpError(404, "group not found");
     const memberIds: string[] = JSON.parse(group.member_ids);
     if (!memberIds.includes(me.id)) throw new HttpError(403, "not a group member");
-    const loan = db
+    const loan = await db
       .prepare("SELECT * FROM loans WHERE group_id = ? ORDER BY id DESC LIMIT 1")
       .get(groupId) as { id: number; signatures: string } | undefined;
     if (!loan) throw new HttpError(404, "Ask for a loan before signing.");
@@ -425,7 +500,7 @@ api.post(
     const txs = [];
     for (const memberId of memberIds) {
       if (signatures.includes(memberId)) continue;
-      const member = userById(memberId);
+      const member = await userById(memberId);
       const result = await invoke({
         contractId: cfg.lendingPoolContractId,
         method: "sign",
@@ -435,51 +510,127 @@ api.post(
       signatures.push(memberId);
       txs.push(result);
     }
-    db.prepare("UPDATE loans SET signatures = ? WHERE id = ?").run(JSON.stringify(signatures), loan.id);
+    await db.prepare("UPDATE loans SET signatures = ? WHERE id = ?").run(JSON.stringify(signatures), loan.id);
     res.json({ signatures, txs });
+  }),
+);
+
+api.get(
+  "/loans/:groupId/gate",
+  asyncHandler(async (req, res) => {
+    const me = await userByToken(req);
+    const groupId = Number(req.params.groupId);
+    const group = (await db.prepare("SELECT * FROM groups WHERE id = ?").get(groupId)) as
+      | { id: number; onchain_id: number; leader_id: string }
+      | undefined;
+    if (!group) throw new HttpError(404, "group not found");
+    const leader = await userById(group.leader_id);
+    const fresh = leader.id === me.id ? await refreshSep12(leader) : leader;
+    const loan = (await db
+      .prepare("SELECT * FROM loans WHERE group_id = ? ORDER BY id DESC LIMIT 1")
+      .get(groupId)) as { id: number; principal: string } | undefined;
+    if (!loan) throw new HttpError(404, "loan not found");
+    const decision = evaluateDisburseGate({
+      kycStatus: fresh.kyc_status,
+      amountStroops: loan.principal,
+      publicKey: fresh.public_key,
+    });
+    let onchainKyc = false;
+    try {
+      const cfg = loadTestnetConfig();
+      if (cfg.lendingPoolContractId && config.deployerSecret) {
+        onchainKyc = Boolean(
+          await readContract({
+            contractId: cfg.lendingPoolContractId,
+            method: "is_kyc_approved",
+            args: [fresh.public_key],
+            source: deployerKeypair(),
+          }),
+        );
+      }
+    } catch (err) {
+      log.error("is_kyc_approved read failed", { err: String(err) });
+    }
+    res.json({
+      ...decision,
+      onchainKyc,
+      amlMaxAmount: config.amlMaxAmount,
+      denylisted: parseDenylist().includes(fresh.public_key.toUpperCase()),
+    });
   }),
 );
 
 api.post(
   "/loans/:groupId/disburse",
   asyncHandler(async (req, res) => {
-    const me = userByToken(req);
-    requireKyc(me, "disbursement");
+    const me = await userByToken(req);
     const groupId = Number(req.params.groupId);
-    const group = db.prepare("SELECT * FROM groups WHERE id = ?").get(groupId) as
+    const group = (await db.prepare("SELECT * FROM groups WHERE id = ?").get(groupId)) as
       | { id: number; onchain_id: number; leader_id: string; member_ids: string }
       | undefined;
     if (!group) throw new HttpError(404, "group not found");
     if (group.leader_id !== me.id) throw new HttpError(403, "only the leader can disburse");
-    const loan = db
+    const loan = (await db
       .prepare("SELECT * FROM loans WHERE group_id = ? ORDER BY id DESC LIMIT 1")
-      .get(groupId) as { id: number; signatures: string } | undefined;
+      .get(groupId)) as { id: number; signatures: string; principal: string } | undefined;
     if (!loan) throw new HttpError(404, "loan not found");
+    const fresh = await refreshSep12(me);
+    const decision = evaluateDisburseGate({
+      kycStatus: fresh.kyc_status,
+      amountStroops: loan.principal,
+      publicKey: fresh.public_key,
+    });
+    await writeGateAudit({
+      userId: me.id,
+      publicKey: me.public_key,
+      action: "disburse",
+      kycStatus: decision.kycStatus,
+      amount: decision.amount,
+      allowed: decision.allowed,
+      reason: decision.reason,
+      code: decision.code,
+      groupId,
+      loanId: loan.id,
+    });
+    if (!decision.allowed) {
+      throw new HttpError(403, decision.reason);
+    }
+    const kycTx = await approveLeaderOnchain(me.public_key);
     const cfg = requireContracts();
+    const kp = keypairFromEncrypted(me.secret_enc);
+    await ensureTrustline(kp);
     const result = await invoke({
       contractId: cfg.lendingPoolContractId,
       method: "disburse",
-      args: [{ u64: group.onchain_id }],
-      source: keypairFromEncrypted(me.secret_enc),
+      args: [{ u64: Number(group.onchain_id) }],
+      source: kp,
     });
     const now = Math.floor(Date.now() / 1000);
-    db.prepare(
-      `UPDATE loans SET status = 'DISBURSED', disbursed_at = ?, due_at = ?, disburse_tx = ? WHERE id = ?`,
-    ).run(now, now + LOAN_TERM_SECONDS, result.hash, loan.id);
-    res.json({ status: "DISBURSED", dueAt: now + LOAN_TERM_SECONDS, tx: result });
+    await db
+      .prepare(
+        `UPDATE loans SET status = 'DISBURSED', disbursed_at = ?, due_at = ?, disburse_tx = ? WHERE id = ?`,
+      )
+      .run(now, now + LOAN_TERM_SECONDS, result.hash, loan.id);
+    res.json({
+      status: "DISBURSED",
+      dueAt: now + LOAN_TERM_SECONDS,
+      tx: result,
+      kycOnchain: kycTx,
+      gate: decision,
+    });
   }),
 );
 
 api.post(
   "/loans/:groupId/repay",
   asyncHandler(async (req, res) => {
-    const me = userByToken(req);
+    const me = await userByToken(req);
     const groupId = Number(req.params.groupId);
-    const group = db.prepare("SELECT * FROM groups WHERE id = ?").get(groupId) as
+    const group = await db.prepare("SELECT * FROM groups WHERE id = ?").get(groupId) as
       | { id: number; onchain_id: number }
       | undefined;
     if (!group) throw new HttpError(404, "group not found");
-    const loan = db
+    const loan = await db
       .prepare("SELECT * FROM loans WHERE group_id = ? ORDER BY id DESC LIMIT 1")
       .get(groupId) as { id: number } | undefined;
     if (!loan) throw new HttpError(404, "loan not found");
@@ -492,7 +643,7 @@ api.post(
       args: [{ u64: group.onchain_id }, me.public_key],
       source: kp,
     });
-    db.prepare(`UPDATE loans SET status = 'REPAID', repay_tx = ?, flagged_overdue = 0 WHERE id = ?`).run(
+    await db.prepare(`UPDATE loans SET status = 'REPAID', repay_tx = ?, flagged_overdue = 0 WHERE id = ?`).run(
       result.hash,
       loan.id,
     );
@@ -503,13 +654,13 @@ api.post(
 api.post(
   "/loans/:groupId/default",
   asyncHandler(async (req, res) => {
-    const me = userByToken(req);
+    const me = await userByToken(req);
     const groupId = Number(req.params.groupId);
-    const group = db.prepare("SELECT * FROM groups WHERE id = ?").get(groupId) as
+    const group = await db.prepare("SELECT * FROM groups WHERE id = ?").get(groupId) as
       | { id: number; onchain_id: number }
       | undefined;
     if (!group) throw new HttpError(404, "group not found");
-    const loan = db
+    const loan = await db
       .prepare("SELECT * FROM loans WHERE group_id = ? ORDER BY id DESC LIMIT 1")
       .get(groupId) as { id: number } | undefined;
     if (!loan) throw new HttpError(404, "loan not found");
@@ -520,7 +671,7 @@ api.post(
       args: [{ u64: group.onchain_id }],
       source: keypairFromEncrypted(me.secret_enc),
     });
-    db.prepare(`UPDATE loans SET status = 'DEFAULTED', default_tx = ? WHERE id = ?`).run(
+    await db.prepare(`UPDATE loans SET status = 'DEFAULTED', default_tx = ? WHERE id = ?`).run(
       result.hash,
       loan.id,
     );
@@ -531,7 +682,7 @@ api.post(
 api.get(
   "/loans",
   asyncHandler(async (_req, res) => {
-    const rows = db.prepare("SELECT * FROM loans ORDER BY id DESC").all();
+    const rows = await db.prepare("SELECT * FROM loans ORDER BY id DESC").all();
     res.json({ loans: rows });
   }),
 );
@@ -539,7 +690,7 @@ api.get(
 api.post(
   "/pool/deposit",
   asyncHandler(async (req, res) => {
-    const me = userByToken(req);
+    const me = await userByToken(req);
     const body = z.object({ amount: z.string().or(z.number()) }).parse(req.body);
     const amount = toStroops(body.amount);
     const kp = keypairFromEncrypted(me.secret_enc);
@@ -558,7 +709,7 @@ api.post(
 api.post(
   "/pool/withdraw",
   asyncHandler(async (req, res) => {
-    const me = userByToken(req);
+    const me = await userByToken(req);
     const body = z.object({ amount: z.string().or(z.number()) }).parse(req.body);
     const amount = toStroops(body.amount);
     const kp = keypairFromEncrypted(me.secret_enc);
@@ -576,7 +727,7 @@ api.post(
 api.get(
   "/escrow",
   asyncHandler(async (_req, res) => {
-    const rows = db.prepare("SELECT * FROM escrows ORDER BY id DESC").all();
+    const rows = await db.prepare("SELECT * FROM escrows ORDER BY id DESC").all();
     res.json({ escrows: rows });
   }),
 );
@@ -584,14 +735,14 @@ api.get(
 api.post(
   "/escrow",
   asyncHandler(async (req, res) => {
-    const me = userByToken(req);
+    const me = await userByToken(req);
     const body = z
       .object({
         sellerId: z.string(),
         amount: z.string().or(z.number()),
       })
       .parse(req.body);
-    const seller = userById(body.sellerId);
+    const seller = await userById(body.sellerId);
     const amount = toStroops(body.amount);
     const cfg = requireContracts();
     const result = await invoke({
@@ -601,7 +752,7 @@ api.post(
       source: keypairFromEncrypted(me.secret_enc),
     });
     const onchainId = Number(result.returnValue);
-    const info = db
+    const info = await db
       .prepare(
         `INSERT INTO escrows (onchain_id, buyer_id, seller_id, amount, status, create_tx, created_at)
          VALUES (?, ?, ?, ?, 'CREATED', ?, ?)`,
@@ -614,8 +765,8 @@ api.post(
 api.post(
   "/escrow/:id/fund",
   asyncHandler(async (req, res) => {
-    const me = userByToken(req);
-    const row = db.prepare("SELECT * FROM escrows WHERE id = ?").get(Number(req.params.id)) as
+    const me = await userByToken(req);
+    const row = await db.prepare("SELECT * FROM escrows WHERE id = ?").get(Number(req.params.id)) as
       | { id: number; onchain_id: number; buyer_id: string }
       | undefined;
     if (!row) throw new HttpError(404, "escrow not found");
@@ -629,7 +780,7 @@ api.post(
       args: [{ u64: row.onchain_id }],
       source: kp,
     });
-    db.prepare("UPDATE escrows SET status = 'FUNDED', fund_tx = ? WHERE id = ?").run(result.hash, row.id);
+    await db.prepare("UPDATE escrows SET status = 'FUNDED', fund_tx = ? WHERE id = ?").run(result.hash, row.id);
     res.json({ status: "FUNDED", tx: result });
   }),
 );
@@ -637,8 +788,8 @@ api.post(
 api.post(
   "/escrow/:id/confirm",
   asyncHandler(async (req, res) => {
-    const me = userByToken(req);
-    const row = db.prepare("SELECT * FROM escrows WHERE id = ?").get(Number(req.params.id)) as
+    const me = await userByToken(req);
+    const row = await db.prepare("SELECT * FROM escrows WHERE id = ?").get(Number(req.params.id)) as
       | { id: number; onchain_id: number; buyer_id: string }
       | undefined;
     if (!row) throw new HttpError(404, "escrow not found");
@@ -650,7 +801,7 @@ api.post(
       args: [{ u64: row.onchain_id }],
       source: keypairFromEncrypted(me.secret_enc),
     });
-    db.prepare("UPDATE escrows SET status = 'RELEASED', close_tx = ? WHERE id = ?").run(
+    await db.prepare("UPDATE escrows SET status = 'RELEASED', close_tx = ? WHERE id = ?").run(
       result.hash,
       row.id,
     );
@@ -661,8 +812,8 @@ api.post(
 api.post(
   "/escrow/:id/refund",
   asyncHandler(async (req, res) => {
-    const me = userByToken(req);
-    const row = db.prepare("SELECT * FROM escrows WHERE id = ?").get(Number(req.params.id)) as
+    const me = await userByToken(req);
+    const row = await db.prepare("SELECT * FROM escrows WHERE id = ?").get(Number(req.params.id)) as
       | { id: number; onchain_id: number }
       | undefined;
     if (!row) throw new HttpError(404, "escrow not found");
@@ -673,7 +824,7 @@ api.post(
       args: [{ u64: row.onchain_id }, me.public_key],
       source: keypairFromEncrypted(me.secret_enc),
     });
-    db.prepare("UPDATE escrows SET status = 'REFUNDED', close_tx = ? WHERE id = ?").run(
+    await db.prepare("UPDATE escrows SET status = 'REFUNDED', close_tx = ? WHERE id = ?").run(
       result.hash,
       row.id,
     );
@@ -684,8 +835,8 @@ api.post(
 api.post(
   "/escrow/:id/dispute",
   asyncHandler(async (req, res) => {
-    const me = userByToken(req);
-    const row = db.prepare("SELECT * FROM escrows WHERE id = ?").get(Number(req.params.id)) as
+    const me = await userByToken(req);
+    const row = await db.prepare("SELECT * FROM escrows WHERE id = ?").get(Number(req.params.id)) as
       | { id: number; onchain_id: number }
       | undefined;
     if (!row) throw new HttpError(404, "escrow not found");
@@ -696,7 +847,7 @@ api.post(
       args: [{ u64: row.onchain_id }, me.public_key],
       source: keypairFromEncrypted(me.secret_enc),
     });
-    db.prepare("UPDATE escrows SET status = 'DISPUTED' WHERE id = ?").run(row.id);
+    await db.prepare("UPDATE escrows SET status = 'DISPUTED' WHERE id = ?").run(row.id);
     res.json({ status: "DISPUTED", tx: result });
   }),
 );
@@ -704,9 +855,9 @@ api.post(
 api.post(
   "/escrow/:id/arbitrate",
   asyncHandler(async (req, res) => {
-    const me = userByToken(req);
+    const me = await userByToken(req);
     const body = z.object({ releaseToSeller: z.boolean() }).parse(req.body);
-    const row = db.prepare("SELECT * FROM escrows WHERE id = ?").get(Number(req.params.id)) as
+    const row = await db.prepare("SELECT * FROM escrows WHERE id = ?").get(Number(req.params.id)) as
       | { id: number; onchain_id: number }
       | undefined;
     if (!row) throw new HttpError(404, "escrow not found");
@@ -721,7 +872,7 @@ api.post(
       source: keypairFromEncrypted(me.secret_enc),
     });
     const status = body.releaseToSeller ? "RELEASED" : "REFUNDED";
-    db.prepare("UPDATE escrows SET status = ?, close_tx = ? WHERE id = ?").run(
+    await db.prepare("UPDATE escrows SET status = ?, close_tx = ? WHERE id = ?").run(
       status,
       result.hash,
       row.id,
@@ -733,7 +884,7 @@ api.post(
 api.get(
   "/reputation/:userId",
   asyncHandler(async (req, res) => {
-    const user = userById(routeParam(req, "userId"));
+    const user = await userById(routeParam(req, "userId"));
     const cfg = requireContracts();
     const source = keypairFromEncrypted(user.secret_enc);
     const [score, record, history] = await Promise.all([
@@ -768,7 +919,7 @@ api.get(
 api.post(
   "/anchor/kyc",
   asyncHandler(async (req, res) => {
-    const me = userByToken(req);
+    const me = await userByToken(req);
     const body = z
       .object({
         first_name: z.string().min(1),
@@ -793,23 +944,48 @@ api.post(
     };
     const put = await sep12Put(token, me.public_key, fields);
     const got = await sep12Get(token, me.public_key, put.id);
-    db.prepare("UPDATE users SET kyc_status = ?, kyc_id = ? WHERE id = ?").run(
+    await db.prepare("UPDATE users SET kyc_status = ?, kyc_id = ? WHERE id = ?").run(
       got.status,
       got.id ?? put.id ?? null,
       me.id,
     );
-    res.json({ status: got.status, id: got.id ?? put.id, fields: got.fields });
+    let kycOnchain: { hash: string | null; expert: string | null; already: boolean } | null = null;
+    if (got.status === "ACCEPTED") {
+      try {
+        kycOnchain = await approveLeaderOnchain(me.public_key);
+      } catch (err) {
+        log.error("set_kyc_approved after SEP-12 ACCEPTED failed", { err: String(err) });
+      }
+    }
+    await writeGateAudit({
+      userId: me.id,
+      publicKey: me.public_key,
+      action: "kyc_submit",
+      kycStatus: got.status,
+      allowed: got.status === "ACCEPTED",
+      reason:
+        got.status === "ACCEPTED"
+          ? "SEP-12 ACCEPTED; on-chain set_kyc_approved will run at disburse if needed"
+          : `SEP-12 status ${got.status}`,
+      code: got.status === "ACCEPTED" ? "ALLOWED" : `KYC_${got.status}`,
+    });
+    res.json({
+      status: got.status,
+      id: got.id ?? put.id,
+      fields: got.fields,
+      kycOnchain,
+    });
   }),
 );
 
 api.get(
   "/anchor/kyc",
   asyncHandler(async (req, res) => {
-    const me = userByToken(req);
+    const me = await userByToken(req);
     const kp = keypairFromEncrypted(me.secret_enc);
     const token = await sep10(kp);
     const got = await sep12Get(token, me.public_key, me.kyc_id);
-    db.prepare("UPDATE users SET kyc_status = ? WHERE id = ?").run(got.status, me.id);
+    await db.prepare("UPDATE users SET kyc_status = ? WHERE id = ?").run(got.status, me.id);
     res.json({ status: got.status, id: got.id });
   }),
 );
@@ -817,7 +993,7 @@ api.get(
 api.post(
   "/anchor/withdraw",
   asyncHandler(async (req, res) => {
-    const me = userByToken(req);
+    const me = await userByToken(req);
     const body = z.object({ amount: z.string() }).parse(req.body);
     const kp = keypairFromEncrypted(me.secret_enc);
     const token = await sep10(kp);
@@ -828,7 +1004,7 @@ api.post(
       amount: body.amount,
       assetCode: asset.code,
     });
-    db.prepare(
+    await db.prepare(
       `INSERT INTO anchor_txs (id, user_id, kind, status, url, created_at) VALUES (?, ?, 'withdraw', ?, ?, ?)`,
     ).run(withdraw.id, me.id, withdraw.type, withdraw.url, Date.now());
     log.info("SEP-24 withdraw started", { id: withdraw.id, account: me.public_key });
@@ -845,7 +1021,7 @@ api.post(
 api.post(
   "/anchor/withdraw/:id/pay",
   asyncHandler(async (req, res) => {
-    const me = userByToken(req);
+    const me = await userByToken(req);
     const id = routeParam(req, "id");
     const kp = keypairFromEncrypted(me.secret_enc);
     const token = await sep10(kp);
@@ -885,7 +1061,7 @@ api.post(
       finalTx = unwrapSep24Transaction(await sep24Transaction(token, id));
       finalStatus = finalTx.status;
     }
-    db.prepare("UPDATE anchor_txs SET status = ? WHERE id = ?").run(finalStatus, id);
+    await db.prepare("UPDATE anchor_txs SET status = ? WHERE id = ?").run(finalStatus, id);
     res.json({
       id,
       payment: sent,
@@ -901,7 +1077,7 @@ api.post(
 api.post(
   "/anchor/deposit",
   asyncHandler(async (req, res) => {
-    const me = userByToken(req);
+    const me = await userByToken(req);
     const body = z.object({ amount: z.string() }).parse(req.body);
     const kp = keypairFromEncrypted(me.secret_enc);
     const token = await sep10(kp);
@@ -910,7 +1086,7 @@ api.post(
       account: me.public_key,
       amount: body.amount,
     });
-    db.prepare(
+    await db.prepare(
       `INSERT INTO anchor_txs (id, user_id, kind, status, url, created_at) VALUES (?, ?, 'deposit', ?, ?, ?)`,
     ).run(deposit.id, me.id, deposit.type, deposit.url, Date.now());
     res.json(deposit);
@@ -920,22 +1096,45 @@ api.post(
 api.get(
   "/anchor/transactions/:id",
   asyncHandler(async (req, res) => {
-    const me = userByToken(req);
+    const me = await userByToken(req);
     const id = routeParam(req, "id");
     const token = await sep10(keypairFromEncrypted(me.secret_enc));
     const tx = await sep24Transaction(token, id);
     const inner = unwrapSep24Transaction(tx);
     if (inner.status) {
-      db.prepare("UPDATE anchor_txs SET status = ? WHERE id = ?").run(inner.status, id);
+      await db.prepare("UPDATE anchor_txs SET status = ? WHERE id = ?").run(inner.status, id);
     }
     res.json(tx);
   }),
 );
 
-api.get("/loans/overdue", (_req, res) => {
-  const rows = db.prepare("SELECT * FROM loans WHERE flagged_overdue = 1").all();
-  res.json({ loans: rows });
-});
+api.get(
+  "/gate/config",
+  asyncHandler(async (_req, res) => {
+    res.json({
+      amlMaxAmount: config.amlMaxAmount,
+      denylistCount: parseDenylist().length,
+      anchor: config.anchorHomeDomain,
+    });
+  }),
+);
+
+api.get(
+  "/gate/audit",
+  asyncHandler(async (req, res) => {
+    await userByToken(req);
+    const rows = await db.prepare("SELECT * FROM gate_audit ORDER BY id DESC LIMIT 50").all();
+    res.json({ audit: rows });
+  }),
+);
+
+api.get(
+  "/loans/overdue",
+  asyncHandler(async (_req, res) => {
+    const rows = await db.prepare("SELECT * FROM loans WHERE flagged_overdue = 1").all();
+    res.json({ loans: rows });
+  }),
+);
 
 api.use(
   (

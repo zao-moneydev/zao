@@ -195,6 +195,46 @@ export async function readContract(opts: {
   return scValToNative(sim.result.retval);
 }
 
+export function deployerKeypair(): Keypair {
+  if (!config.deployerSecret) {
+    throw new Error("DEPLOYER_SECRET is required to set on-chain KYC");
+  }
+  return Keypair.fromSecret(config.deployerSecret);
+}
+
+/** Live RPC simulation. Used to prove the contract rejects a non-approved leader. */
+export async function simulateInvoke(opts: {
+  contractId: string;
+  method: string;
+  args: unknown[];
+  source: Keypair;
+}): Promise<{ ok: boolean; error?: string; detail?: string }> {
+  const sourceAccount = await server.getAccount(opts.source.publicKey());
+  const contract = new Contract(opts.contractId);
+  const built = new TransactionBuilder(sourceAccount, {
+    fee: BASE_FEE,
+    networkPassphrase: config.networkPassphrase,
+  })
+    .addOperation(contract.call(opts.method, ...scArgs(opts.args)))
+    .setTimeout(30)
+    .build();
+  const sim = await server.simulateTransaction(built);
+  if (rpc.Api.isSimulationSuccess(sim)) {
+    return { ok: true };
+  }
+  const errText =
+    "error" in sim && typeof (sim as { error?: unknown }).error === "string"
+      ? String((sim as { error: string }).error)
+      : JSON.stringify(sim);
+  const detail = errText.slice(0, 1200);
+  const code = detail.match(/Error\(Contract, #(\d+)\)/i) ?? detail.match(/#(\d+)/);
+  const named: Record<string, string> = { "22": "KycRequired" };
+  const error = code
+    ? `Contract error #${code[1]}${named[code[1]] ? ` (${named[code[1]]})` : ""}`
+    : detail.slice(0, 180);
+  return { ok: false, error, detail };
+}
+
 export async function invoke(opts: {
   contractId: string;
   method: string;

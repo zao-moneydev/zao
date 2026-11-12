@@ -91,6 +91,9 @@ input[type="checkbox"] {
 .members label:hover { background: #eef4f0; }
 .list { padding-left: 18px; color: var(--muted); }
 .divider { text-align: center; color: var(--muted); margin: 18px 0 8px; }
+.status-pill { margin: 12px 0; font-size: 15px; }
+.gate-block { margin-top: 14px; }
+.expert-link { color: var(--ok); word-break: break-all; }
 code { background: #eef4f0; padding: 2px 6px; border-radius: 6px; }
 @media (max-width: 700px) {
   .row { grid-template-columns: 1fr; }

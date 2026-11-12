@@ -2,9 +2,9 @@ import express from "express";
 import cors from "cors";
 import { api } from "./api.ts";
 import { config, loadTestnetConfig } from "./config.ts";
+import { dbDriver } from "./db.ts";
 import { startLoanMonitor } from "./jobs.ts";
 import { log } from "./log.ts";
-import "./db.ts";
 
 if (!config.walletKey) {
   throw new Error("WALLET_ENCRYPTION_KEY is required. Copy .env.example to .env and generate a key.");
@@ -34,5 +34,6 @@ app.listen(config.port, () => {
     network: config.network,
     anchor: config.anchorHomeDomain,
     lendingPool: cfg.lendingPoolContractId || "(not deployed)",
+    db: dbDriver,
   });
 });

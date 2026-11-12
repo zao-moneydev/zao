@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "start": "tsx src/index.ts",
-    "test": "tsx --test src/wallets.test.ts src/stellar.test.ts src/jobs.test.ts src/sep.test.ts",
+    "test": "tsx --test src/wallets.test.ts src/stellar.test.ts src/jobs.test.ts src/sep.test.ts src/kyc-gate.test.ts",
+    "demo:kyc": "tsx scripts/demo-kyc.ts",
     "deploy": "tsx scripts/deploy.ts",
     "deploy:testnet": "tsx scripts/deploy.ts",
     "e2e": "tsx scripts/e2e-testnet.ts",
@@ -17,6 +18,7 @@
     "cors": "^2.8.5",
     "dotenv": "^16.6.1",
     "express": "^5.1.0",
+    "postgres": "^4.1.1",
     "zod": "^3.25.76"
   },
   "devDependencies": {

@@ -17,6 +17,7 @@ zao_money/
 ├── wasm/                     # built contract bytecode
 ├── backend/                  # Node.js + TypeScript API, wallets, SEPs, jobs, scripts
 ├── client/                   # responsive web demo
+├── supabase/migrations/      # hosted Postgres schema (users, sessions, groups, loans, escrows, anchor_txs)
 ├── config/testnet.json       # contract IDs written by deploy (created at runtime)
 └── .env.example
 ```
@@ -94,15 +95,22 @@ Hashes and sizes of the committed artifacts are in [`wasm/README.md`](wasm/READM
 flowchart LR
   Trader[Trader web demo] --> API[Backend API]
   API --> Wallets[Encrypted invisible wallets]
-  API --> Anchor[SEP-10 / 12 / 24 anchor]
-  API --> RPC[Soroban RPC testnet]
+  API --> Gate[KYC/AML gate + audit log]
+  Gate --> Anchor[SEP-10 / 12 / 24 anchor]
+  Gate --> RPC[Soroban RPC testnet]
   RPC --> Pool[lending_pool]
   RPC --> Rep[reputation]
   RPC --> Escrow[marketplace_escrow]
-  Pool --> USDC[USDC SAC]
+  Pool --> USDC[USDC/SRT SAC]
   Pool --> Rep
   Anchor --> TestAnchor[testanchor.stellar.org]
+  Pool -->|set_kyc_approved + disburse| Leader[Group leader]
 ```
+
+Disburse is gated twice:
+
+1. **Off-chain** — `POST /api/loans/:groupId/disburse` requires SEP-12 `ACCEPTED`, then AML (max amount + denylist). Every decision is written to `gate_audit`.
+2. **On-chain** — after ACCEPTED, the admin calls `lending_pool.set_kyc_approved(leader, true)`. The contract still rejects `disburse` with `KycRequired` (#22) if that flag is missing.
 
 ## Setup
 
@@ -112,6 +120,8 @@ Prerequisites: Rust 1.84+ with `wasm32v1-none`, [Stellar CLI](https://developers
 copy .env.example .env
 # set WALLET_ENCRYPTION_KEY to 64 hex chars:
 node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+# optional: paste DATABASE_URL from the Supabase project (ktqukwdgsfjdhvenydmd)
+# so the API uses hosted Postgres instead of local SQLite
 ```
 
 ```powershell
@@ -122,7 +132,8 @@ npm install
 npx playwright install chromium
 npm test
 npm run deploy:testnet  # deploys wasm/ to testnet, writes config/testnet.json
-npm run demo:payout     # group → disburse → SEP-24 payment to the anchor
+npm run demo:payout     # Deliverable 2: group → disburse → SEP-24 payment to the anchor
+npm run demo:kyc        # Deliverable 3: blocked KYC → ACCEPTED → disburse → cash-out
 npm run dev             # API on :3001
 ```
 
@@ -154,15 +165,14 @@ npm run dev             # demo on :5173, proxies /api to the backend
 
 ## Demo script (web)
 
-1. Register three users (each gets a funded invisible testnet wallet).
-2. Submit KYC for the leader (`Cash out` tab) and wait until status is `ACCEPTED`.
-3. As the leader, create a group and invite the other two.
-4. Request a loan. Sign in as each member and press **Sign**.
-5. Disburse — blocked if KYC is not `ACCEPTED`.
-6. Cash out via the anchor interactive URL (SEP-24).
-7. Repay 110%. Read reputation for each member.
+1. **Try the demo** (Thabo, Lerato, Sipho — each gets a funded invisible testnet wallet).
+2. Form a group of 3. Request a loan (default 2). **Everyone signs**.
+3. **KYC & pay**: disburse is disabled with the gate reason while status is `NEEDS_INFO`.
+4. Submit the KYC form. When the anchor reports `ACCEPTED`, the backend calls `set_kyc_approved`.
+5. **Disburse** — stellar.expert link on success.
+6. **Cash out** via the SEP-24 interactive URL.
 
-CLI equivalent: `cd backend && npm run e2e`.
+Screen-recording narration: [`evidence/demo-script.md`](evidence/demo-script.md). CLI: `cd backend && npm run demo:kyc`.
 
 Latest live testnet run (group 2, loan 2) — every hash is on [stellar.expert testnet](https://stellar.expert/explorer/testnet):
 
@@ -192,22 +202,58 @@ Last deploy (`2026-11-12T06:50:12Z`) wrote `config/testnet.json`. Pool asset is 
 | lending_pool | `CBZGLCLXSEEYN44RKFIW5KDGTSCV4X5TW5DRJKRF5UXV5VPKPD4UZAEX` | [stellar.expert](https://stellar.expert/explorer/testnet/contract/CBZGLCLXSEEYN44RKFIW5KDGTSCV4X5TW5DRJKRF5UXV5VPKPD4UZAEX) |
 | marketplace_escrow | `CDOASBD2VSNG3SO6SF4OQHVGLY3EAA57JQHF34U4DW3MAMJB6UNUZMMQ` | [stellar.expert](https://stellar.expert/explorer/testnet/contract/CDOASBD2VSNG3SO6SF4OQHVGLY3EAA57JQHF34U4DW3MAMJB6UNUZMMQ) |
 
-Deliverable 2 payout evidence (SEP-24 **completed**): [`evidence/deliverable2.md`](evidence/deliverable2.md). Payment to the anchor: [`82149e84…`](https://stellar.expert/explorer/testnet/tx/82149e84e87c3b09b38339863bcee656597e351d1d195d819f52e1c81dce3e5f).
+## Evidence
 
-## KYC / AML gate
+| Deliverable | Proof |
+|---|---|
+| 1. Contracts | 56 host tests; optimized wasm in [`wasm/`](wasm/); [`wasm/README.md`](wasm/README.md) |
+| 2. SEP-24 payout | [`evidence/deliverable2.md`](evidence/deliverable2.md) — payment [`82149e84…`](https://stellar.expert/explorer/testnet/tx/82149e84e87c3b09b38339863bcee656597e351d1d195d819f52e1c81dce3e5f) |
+| 3. KYC/AML gate | [`evidence/deliverable3.md`](evidence/deliverable3.md), screenshots `evidence/screenshots/d3-*.png`, script [`evidence/demo-script.md`](evidence/demo-script.md) — blocked `#22 KycRequired` + API 403 `NEEDS_INFO`, then allowed disburse [`6bac3ff0…`](https://stellar.expert/explorer/testnet/tx/6bac3ff00e516b453992d99cbfebdd3134d99f0312ee273f8a887f9332989a95) |
 
-`lending_pool.disburse` fails with `KycRequired` unless `set_kyc_approved(admin, leader, true)` has been called. The backend SEP-12 gate (`POST /api/loans/:id/disburse`) is Deliverable 3 and is not part of this contract suite.
+## KYC / AML gate (Deliverable 3)
+
+SEP-12 against `ANCHOR_HOME_DOMAIN` (default testanchor): `PUT /customer`, `GET /customer` (`NEEDS_INFO`, `PROCESSING`, `ACCEPTED`, `REJECTED`).
+
+`POST /api/loans/:groupId/disburse` allows only **ACCEPTED**, then AML:
+
+- `AML_MAX_AMOUNT` (human units, default `1000`)
+- `AML_DENYLIST` (comma-separated `G…` keys)
+
+On ACCEPTED the admin invokes `set_kyc_approved(leader, true)` so the contract check passes. Decisions are stored in `gate_audit` (who, status, allowed/blocked, time, reason).
+
+`GET /api/loans/:groupId/gate` drives the disabled Disburse button in the web demo.
+
+Live testnet run (group 7, `npm run demo:kyc`, 2026-11-12):
+
+| Step | Result |
+|---|---|
+| On-chain `disburse` before KYC | live simulation **Contract error #22 (KycRequired)** |
+| API `POST /loans/:id/disburse` | **403** `NEEDS_INFO` |
+| `set_kyc_approved` | [`29263511…`](https://stellar.expert/explorer/testnet/tx/2926351161c958950ac8bdead0d6e5c61538d3c3e7c8f2f177aadcd7613847ab) |
+| Allowed `disburse` | [`6bac3ff0…`](https://stellar.expert/explorer/testnet/tx/6bac3ff00e516b453992d99cbfebdd3134d99f0312ee273f8a887f9332989a95) |
+| SEP-24 cash-out | `e0b284e7-…` **completed**; payment [`2e527501…`](https://stellar.expert/explorer/testnet/tx/2e527501757cd8fbaa42561f453ab27691231fa1f60ee7b12647b0c1e01e25cd) |
 
 A background job flags disbursed loans once `due_at` (day 30) is reached (`GET /api/loans/overdue`).
+
+## Database (Supabase)
+
+Hosted project: [`ktqukwdgsfjdhvenydmd`](https://ktqukwdgsfjdhvenydmd.supabase.co) (`users`, `sessions`, `groups`, `loans`, `escrows`, `anchor_txs`). RLS is on and `anon`/`authenticated` have no grants — encrypted wallet secrets stay off the Data API. The backend uses `DATABASE_URL` (service connection). Unit tests keep using local SQLite.
+
+```powershell
+# Project Settings → Database → URI (session mode or pooler)
+# paste into .env as DATABASE_URL=postgresql://...
+cd backend
+npm run dev   # health JSON includes `"db": "postgres"` once DATABASE_URL is set
+```
 
 ## Tests
 
 - Contract unit tests: `cargo test` — every public function, including failure cases (wrong group size, missing signature, double disburse, wrong repay amount, late repay, unauthorized callers, KYC gate, escrow timeouts, disputes, `mark_shipped`).
-- Wallet encryption, interest math, SEP-10 signing, SEP-24 poll/payment builders: `cd backend && npm test` (HTTP is mocked in unit tests).
+- Wallet encryption, interest math, SEP-10 signing, SEP-24 poll/payment builders, KYC/AML gate: `cd backend && npm test` (HTTP is mocked in unit tests).
+- On-chain KYC rejection: `disburse_fails_without_leader_kyc` in `contracts/lending_pool` (`cargo test -p lending_pool`).
 
 ## What is unfinished
 
-- **KYC gate UI / guided web demo** — Deliverable 3. On-chain `set_kyc_approved` is used by `demo:payout`.
 - **Flutter app** — the spec allowed a web demo instead; `stellar_flutter_sdk` is not in this MVP.
 
 ## Contact

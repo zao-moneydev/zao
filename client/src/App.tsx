@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { api, getToken, setToken, type Group, type User } from "./api";
 
-type Step = "wallet" | "group" | "loan" | "cash" | "shop";
+type Step = "wallet" | "group" | "loan" | "kyc" | "cash" | "shop";
 
 function fromErr(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
@@ -104,7 +104,7 @@ export default function App() {
         {me ? (
           <div className="who">
             <strong>{me.name}</strong>
-            <span>KYC {me.kycStatus === "ACCEPTED" ? "approved" : "not yet"}</span>
+            <span data-testid="kyc-badge">KYC {me.kycStatus === "ACCEPTED" ? "ACCEPTED" : me.kycStatus}</span>
             <button
               className="link"
               onClick={() => {
@@ -135,11 +135,17 @@ export default function App() {
             ["wallet", "1. Wallet"],
             ["group", "2. Group"],
             ["loan", "3. Loan"],
-            ["cash", "4. Cash & repay"],
-            ["shop", "5. Shop"],
+            ["kyc", "4. KYC & pay"],
+            ["cash", "5. Cash out"],
+            ["shop", "6. Shop"],
           ] as [Step, string][]
         ).map(([id, label]) => (
-          <button key={id} className={step === id ? "active" : ""} onClick={() => setStep(id)}>
+          <button
+            key={id}
+            data-testid={`nav-${id}`}
+            className={step === id ? "active" : ""}
+            onClick={() => setStep(id)}
+          >
             {label}
           </button>
         ))}
@@ -182,6 +188,18 @@ export default function App() {
           run={run}
           refresh={refresh}
           note={note}
+          onSigned={() => setStep("kyc")}
+        />
+      )}
+      {step === "kyc" && (
+        <KycStep
+          me={me}
+          groups={myGroups}
+          busy={Boolean(busy)}
+          run={run}
+          refresh={refresh}
+          note={note}
+          onPaid={() => setStep("cash")}
         />
       )}
       {step === "cash" && (
@@ -224,6 +242,7 @@ function WalletStep({
       </p>
       <button
         className="primary"
+        data-testid="demo-start"
         disabled={busy}
         onClick={() =>
           run("creating 3 demo traders", async () => {
@@ -342,6 +361,7 @@ function GroupStep({
           <label key={user.id}>
             <input
               type="checkbox"
+              data-testid={`pick-${user.name.toLowerCase()}`}
               checked={picked.includes(user.id)}
               onChange={(e) =>
                 setPicked((cur) =>
@@ -355,6 +375,7 @@ function GroupStep({
       </div>
       <button
         className="primary"
+        data-testid="create-group"
         disabled={busy || picked.length < 2}
         onClick={() =>
           run("creating group", async () => {
@@ -386,6 +407,7 @@ function LoanStep({
   run,
   refresh,
   note,
+  onSigned,
 }: {
   me: User | null;
   groups: Group[];
@@ -393,9 +415,10 @@ function LoanStep({
   run: (label: string, work: () => Promise<void>) => Promise<void>;
   refresh: () => Promise<void>;
   note: (msg: string) => void;
+  onSigned: () => void;
 }) {
   const [groupId, setGroupId] = useState(groups[0]?.id ?? 0);
-  const [amount, setAmount] = useState("10");
+  const [amount, setAmount] = useState("2");
   useEffect(() => {
     if (groups[0] && !groups.some((g) => g.id === groupId)) {
       setGroupId(groups[0].id);
@@ -440,10 +463,11 @@ function LoanStep({
         You repay <strong>{amount || "0"} USDC + 10%</strong> in 30 days.
       </p>
       <label htmlFor="amount">How much USDC?</label>
-      <input id="amount" value={amount} onChange={(e) => setAmount(e.target.value)} />
+      <input id="amount" data-testid="loan-amount" value={amount} onChange={(e) => setAmount(e.target.value)} />
       <div className="actions">
         <button
           className="primary"
+          data-testid="request-loan"
           disabled={busy}
           onClick={() =>
             run("requesting loan", async () => {
@@ -457,38 +481,200 @@ function LoanStep({
         </button>
         <button
           className="ghost"
+          data-testid="sign-all"
           disabled={busy || status === "NONE"}
           onClick={() =>
             run("collecting signatures", async () => {
               const res = await api.signAll(groupId);
               await refresh();
-              note(`Everyone signed (${res.signatures.length} wallets).`);
+              note(`Everyone signed (${res.signatures.length} wallets). Next: KYC.`);
+              onSigned();
             })
           }
         >
           2. Everyone signs
         </button>
+      </div>
+      <p className="muted">After every member signs, the KYC/AML gate must pass before payout.</p>
+    </div>
+  );
+}
+
+function KycStep({
+  me,
+  groups,
+  busy,
+  run,
+  refresh,
+  note,
+  onPaid,
+}: {
+  me: User | null;
+  groups: Group[];
+  busy: boolean;
+  run: (label: string, work: () => Promise<void>) => Promise<void>;
+  refresh: () => Promise<void>;
+  note: (msg: string) => void;
+  onPaid: () => void;
+}) {
+  const [groupId, setGroupId] = useState(groups[0]?.id ?? 0);
+  const [first, setFirst] = useState(() => (me ? splitName(me.name).first_name : "Thabo"));
+  const [last, setLast] = useState(() => (me ? splitName(me.name).last_name : "Mokoena"));
+  const [email, setEmail] = useState(me?.email ?? "");
+  const [gate, setGate] = useState<{
+    allowed: boolean;
+    reason: string;
+    kycStatus: string;
+    onchainKyc: boolean;
+  } | null>(null);
+  const [paid, setPaid] = useState<{ expert: string; hash: string } | null>(null);
+
+  useEffect(() => {
+    if (groups[0] && !groups.some((g) => g.id === groupId)) setGroupId(groups[0].id);
+  }, [groups, groupId]);
+
+  useEffect(() => {
+    if (!groupId) return;
+    api
+      .gate(groupId)
+      .then(setGate)
+      .catch(() => setGate(null));
+  }, [groupId, me?.kycStatus]);
+
+  const group = groups.find((g) => g.id === groupId);
+  const have = signedCount(group);
+  const need = (group?.members ?? []).length || 3;
+  const signed = have >= need && loanStatus(group) !== "NONE";
+
+  if (!me) {
+    return (
+      <div className="card">
+        <h2>KYC / AML gate</h2>
+        <p className="muted">Sign in first.</p>
+      </div>
+    );
+  }
+
+  const blockedReason =
+    gate && !gate.allowed
+      ? gate.reason
+      : !signed
+        ? "Everyone in the group must sign first."
+        : me.kycStatus !== "ACCEPTED"
+          ? `KYC/AML gate: disbursement blocked until ACCEPTED (current: ${me.kycStatus})`
+          : null;
+  const canPay = Boolean(signed && gate?.allowed && me.kycStatus === "ACCEPTED" && !paid);
+
+  return (
+    <div className="card" data-testid="kyc-card">
+      <h2>KYC check, then payout</h2>
+      <p className="muted">
+        The API and the lending_pool contract both require the leader to be KYC-approved. AML also
+        blocks oversized amounts and denylisted addresses.
+      </p>
+      {groups.length > 0 && (
+        <>
+          <label htmlFor="kyc-group">Group</label>
+          <select
+            id="kyc-group"
+            data-testid="kyc-group"
+            value={groupId}
+            onChange={(e) => setGroupId(Number(e.target.value))}
+          >
+            {groups.map((g) => (
+              <option key={g.id} value={g.id}>
+                Group #{g.id} · {loanStatus(g)}
+              </option>
+            ))}
+          </select>
+        </>
+      )}
+      <p className="status-pill" data-testid="kyc-status">
+        Anchor KYC: <strong>{me.kycStatus}</strong>
+        {gate ? ` · on-chain: ${gate.onchainKyc ? "approved" : "not approved"}` : ""}
+      </p>
+      <div className="row">
+        <div>
+          <label htmlFor="kyc-first">First name</label>
+          <input id="kyc-first" data-testid="kyc-first" value={first} onChange={(e) => setFirst(e.target.value)} />
+        </div>
+        <div>
+          <label htmlFor="kyc-last">Last name</label>
+          <input id="kyc-last" data-testid="kyc-last" value={last} onChange={(e) => setLast(e.target.value)} />
+        </div>
+      </div>
+      <label htmlFor="kyc-email">Email</label>
+      <input id="kyc-email" data-testid="kyc-email" value={email} onChange={(e) => setEmail(e.target.value)} />
+      <div className="actions">
         <button
-          className="ghost"
-          disabled={busy || have < need}
+          className="primary"
+          data-testid="kyc-submit"
+          disabled={busy}
           onClick={() =>
-            run("paying out USDC", async () => {
-              const names = splitName(me.name);
-              await api.kyc({
-                first_name: names.first_name,
-                last_name: names.last_name,
-                email_address: me.email,
+            run("submitting KYC", async () => {
+              const res = await api.kyc({
+                first_name: first,
+                last_name: last,
+                email_address: email || me.email,
               });
-              const res = await api.disburse(groupId);
               await refresh();
-              note(`Paid to the leader. ${res.tx.expert}`);
+              if (groupId) setGate(await api.gate(groupId));
+              note(`KYC status: ${res.status}${res.kycOnchain?.expert ? `. On-chain ${res.kycOnchain.expert}` : ""}`);
             })
           }
         >
-          3. Pay out to leader
+          Submit KYC to the anchor
+        </button>
+        <button
+          className="ghost"
+          data-testid="kyc-refresh"
+          disabled={busy}
+          onClick={() =>
+            run("checking KYC", async () => {
+              const res = await api.kycStatus();
+              await refresh();
+              if (groupId) setGate(await api.gate(groupId));
+              note(`KYC status: ${res.status}`);
+            })
+          }
+        >
+          Refresh status
         </button>
       </div>
-      <p className="muted">Payout submits KYC for you, then sends USDC to the group leader.</p>
+      {blockedReason && (
+        <div className="banner error gate-block" data-testid="gate-reason">
+          Disburse blocked: {blockedReason}
+        </div>
+      )}
+      <button
+        className="primary"
+        data-testid="disburse"
+        disabled={busy || !canPay}
+        title={blockedReason ?? "Pay the group leader"}
+        onClick={() =>
+          run("paying out", async () => {
+            const res = await api.disburse(groupId);
+            await refresh();
+            setPaid({ hash: res.tx.hash, expert: res.tx.expert });
+            note(`Paid to the leader. ${res.tx.expert}`);
+          })
+        }
+      >
+        Disburse to group leader
+      </button>
+      {paid && (
+        <>
+          <p className="ok" data-testid="disburse-success">
+            Disbursed.{" "}
+            <a className="expert-link" href={paid.expert} target="_blank" rel="noreferrer">
+              {paid.expert}
+            </a>
+          </p>
+          <button className="ghost" data-testid="goto-cash" onClick={onPaid}>
+            Continue to cash out
+          </button>
+        </>
+      )}
     </div>
   );
 }
@@ -534,6 +720,7 @@ function CashStep({
       <div className="actions">
         <button
           className="primary"
+          data-testid="cash-kyc"
           disabled={busy}
           onClick={() =>
             run("submitting KYC", async () => {
@@ -554,6 +741,7 @@ function CashStep({
       <input id="withdraw" value={amount} onChange={(e) => setAmount(e.target.value)} />
       <button
         className="ghost"
+        data-testid="cash-out"
         disabled={busy}
         onClick={() =>
           run("opening cash-out", async () => {

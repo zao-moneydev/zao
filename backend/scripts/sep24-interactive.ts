@@ -21,7 +21,8 @@ export async function completeSep24Interactive(
   const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
   try {
     log.info("opening SEP-24 interactive page", { url: safeUrl(url) });
-    await page.goto(url, { waitUntil: "networkidle", timeout: 60_000 });
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 90_000 });
+    await page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => undefined);
     await page.waitForTimeout(1_500);
     await page.screenshot({ path: screenshotPath, fullPage: true });
 
