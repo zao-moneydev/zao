@@ -51,6 +51,7 @@ fn setup() -> TestCtx {
     let pool = LendingPoolClient::new(&env, &pool_id);
     pool.initialize(&admin, &token_addr, &reputation_id);
     reputation.set_writer(&pool_id);
+    pool.set_kyc_approved(&admin, &leader, &true);
 
     token_admin.mint(&lender, &1_000_000);
     pool.deposit(&lender, &500_000);
@@ -349,5 +350,114 @@ fn unknown_group_and_loan_fail() {
     assert_eq!(
         ctx.pool.try_sign(&99, &ctx.leader),
         Err(Ok(Error::GroupNotFound))
+    );
+}
+
+#[test]
+fn disburse_fails_without_leader_kyc() {
+    let ctx = setup();
+    ctx.pool.set_kyc_approved(&ctx.admin, &ctx.leader, &false);
+    assert!(!ctx.pool.is_kyc_approved(&ctx.leader));
+
+    let group_id = ctx.pool.create_group(&ctx.leader, &members(&ctx));
+    ctx.pool.request_loan(&group_id, &1_000);
+    sign_all(&ctx, group_id);
+    assert_eq!(
+        ctx.pool.try_disburse(&group_id),
+        Err(Ok(Error::KycRequired))
+    );
+}
+
+#[test]
+fn set_kyc_rejected_for_non_admin() {
+    let ctx = setup();
+    let impostor = Address::generate(&ctx.env);
+    assert_eq!(
+        ctx.pool
+            .try_set_kyc_approved(&impostor, &ctx.leader, &true),
+        Err(Ok(Error::Unauthorized))
+    );
+}
+
+#[test]
+fn double_disburse_fails() {
+    let ctx = setup();
+    let group_id = ctx.pool.create_group(&ctx.leader, &members(&ctx));
+    ctx.pool.request_loan(&group_id, &1_000);
+    sign_all(&ctx, group_id);
+    ctx.pool.disburse(&group_id);
+    assert_eq!(
+        ctx.pool.try_disburse(&group_id),
+        Err(Ok(Error::AlreadyDisbursed))
+    );
+}
+
+#[test]
+fn repay_after_due_date_fails() {
+    let ctx = setup();
+    let group_id = ctx.pool.create_group(&ctx.leader, &members(&ctx));
+    let loan_id = ctx.pool.request_loan(&group_id, &1_000);
+    sign_all(&ctx, group_id);
+    ctx.pool.disburse(&group_id);
+    ctx.token_admin.mint(&ctx.leader, &100);
+    let due_at = ctx.pool.get_loan(&loan_id).due_at;
+    ctx.env.ledger().set_timestamp(due_at);
+    assert_eq!(
+        ctx.pool.try_repay(&group_id, &ctx.leader),
+        Err(Ok(Error::TooLateToRepay))
+    );
+    assert_eq!(
+        ctx.pool.get_group_loan(&group_id).status,
+        LoanStatus::Disbursed
+    );
+}
+
+#[test]
+fn four_and_five_member_groups_can_borrow() {
+    let ctx = setup();
+    let extra_d = Address::generate(&ctx.env);
+    let extra_e = Address::generate(&ctx.env);
+
+    let four = Vec::from_array(
+        &ctx.env,
+        [
+            ctx.leader.clone(),
+            ctx.member_b.clone(),
+            ctx.member_c.clone(),
+            extra_d.clone(),
+        ],
+    );
+    let group4 = ctx.pool.create_group(&ctx.leader, &four);
+    ctx.pool.request_loan(&group4, &2_000);
+    ctx.pool.sign(&group4, &ctx.leader);
+    ctx.pool.sign(&group4, &ctx.member_b);
+    ctx.pool.sign(&group4, &ctx.member_c);
+    ctx.pool.sign(&group4, &extra_d);
+    ctx.pool.disburse(&group4);
+    ctx.token_admin.mint(&ctx.leader, &200);
+    ctx.pool.repay(&group4, &ctx.leader);
+    assert_eq!(ctx.pool.get_group_loan(&group4).status, LoanStatus::Repaid);
+
+    let five = Vec::from_array(
+        &ctx.env,
+        [
+            ctx.leader.clone(),
+            ctx.member_b.clone(),
+            ctx.member_c.clone(),
+            extra_d.clone(),
+            extra_e.clone(),
+        ],
+    );
+    let group5 = ctx.pool.create_group(&ctx.leader, &five);
+    ctx.pool.request_loan(&group5, &3_000);
+    ctx.pool.sign(&group5, &ctx.leader);
+    ctx.pool.sign(&group5, &ctx.member_b);
+    ctx.pool.sign(&group5, &ctx.member_c);
+    ctx.pool.sign(&group5, &extra_d);
+    ctx.pool.sign(&group5, &extra_e);
+    ctx.pool.disburse(&group5);
+    assert_eq!(
+        ctx.pool.get_group_loan(&group5).status,
+        LoanStatus::Disbursed
     );
 }

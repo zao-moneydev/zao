@@ -216,3 +216,97 @@ fn initialize_twice_fails() {
         Err(Ok(Error::AlreadyInitialized))
     );
 }
+
+#[test]
+fn mark_shipped_then_confirm_releases_to_seller() {
+    let ctx = setup();
+    let id = ctx.escrow.create_escrow(&ctx.buyer, &ctx.seller, &1_000);
+    ctx.escrow.fund(&id);
+    ctx.escrow.mark_shipped(&id);
+    assert_eq!(ctx.escrow.get_escrow(&id).status, EscrowStatus::Shipped);
+    ctx.escrow.confirm_delivery(&id);
+    assert_eq!(ctx.token.balance(&ctx.seller), 1_000);
+    assert_eq!(ctx.escrow.get_escrow(&id).status, EscrowStatus::Released);
+}
+
+#[test]
+fn mark_shipped_before_fund_fails() {
+    let ctx = setup();
+    let id = ctx.escrow.create_escrow(&ctx.buyer, &ctx.seller, &1_000);
+    assert_eq!(
+        ctx.escrow.try_mark_shipped(&id),
+        Err(Ok(Error::InvalidStatus))
+    );
+}
+
+#[test]
+fn double_mark_shipped_fails() {
+    let ctx = setup();
+    let id = ctx.escrow.create_escrow(&ctx.buyer, &ctx.seller, &1_000);
+    ctx.escrow.fund(&id);
+    ctx.escrow.mark_shipped(&id);
+    assert_eq!(
+        ctx.escrow.try_mark_shipped(&id),
+        Err(Ok(Error::AlreadyShipped))
+    );
+}
+
+#[test]
+fn mark_shipped_without_auth_fails() {
+    let ctx = setup();
+    let id = ctx.escrow.create_escrow(&ctx.buyer, &ctx.seller, &1_000);
+    ctx.escrow.fund(&id);
+    ctx.env.set_auths(&[]);
+    let result = ctx.escrow.try_mark_shipped(&id);
+    assert!(result.is_err());
+}
+
+#[test]
+fn seller_cannot_refund_after_shipped() {
+    let ctx = setup();
+    let id = ctx.escrow.create_escrow(&ctx.buyer, &ctx.seller, &1_000);
+    ctx.escrow.fund(&id);
+    ctx.escrow.mark_shipped(&id);
+    assert_eq!(
+        ctx.escrow.try_refund(&id, &ctx.seller),
+        Err(Ok(Error::InvalidStatus))
+    );
+}
+
+#[test]
+fn buyer_refund_after_ship_timeout() {
+    let ctx = setup();
+    let id = ctx.escrow.create_escrow(&ctx.buyer, &ctx.seller, &1_000);
+    ctx.escrow.fund(&id);
+    ctx.escrow.mark_shipped(&id);
+    assert_eq!(
+        ctx.escrow.try_refund(&id, &ctx.buyer),
+        Err(Ok(Error::TimeoutNotReached))
+    );
+    let timeout_at = ctx.escrow.get_escrow(&id).timeout_at;
+    ctx.env.ledger().set_timestamp(timeout_at);
+    ctx.escrow.refund(&id, &ctx.buyer);
+    assert_eq!(ctx.token.balance(&ctx.buyer), 50_000);
+    assert_eq!(ctx.escrow.get_escrow(&id).status, EscrowStatus::Refunded);
+}
+
+#[test]
+fn dispute_after_shipped_then_arbitrate() {
+    let ctx = setup();
+    let id = ctx.escrow.create_escrow(&ctx.buyer, &ctx.seller, &2_000);
+    ctx.escrow.fund(&id);
+    ctx.escrow.mark_shipped(&id);
+    ctx.escrow.dispute(&id, &ctx.buyer);
+    assert_eq!(ctx.escrow.get_escrow(&id).status, EscrowStatus::Disputed);
+    ctx.escrow.arbitrate(&id, &false);
+    assert_eq!(ctx.token.balance(&ctx.buyer), 50_000);
+}
+
+#[test]
+fn fund_without_auth_fails() {
+    let ctx = setup();
+    let id = ctx.escrow.create_escrow(&ctx.buyer, &ctx.seller, &1_000);
+    ctx.env.set_auths(&[]);
+    let result = ctx.escrow.try_fund(&id);
+    assert!(result.is_err());
+}

@@ -21,9 +21,13 @@ zao_money/
 └── .env.example
 ```
 
-## Contract interfaces
+## Contract overview (Deliverable 1)
+
+Three Soroban contracts in `contracts/`. Optimized WASM lives in `wasm/` (sizes and SHA-256 hashes in `wasm/README.md`). Every state change emits a `#[contractevent]`. User-facing inputs return `Error` enums — no `unwrap` on contract arguments.
 
 ### `reputation`
+
+Only the lending pool (the configured **writer**) may write scores.
 
 | Function | Auth | Purpose |
 |---|---|---|
@@ -31,32 +35,58 @@ zao_money/
 | `set_writer(writer)` | admin | Lending pool address is the only writer |
 | `record_repayment(member, loan_id, amount)` | writer | +10 score |
 | `record_default(member, loan_id)` | writer | −20 score |
-| `get_score` / `get_record` / `get_history` | — | Reads |
+| `get_score` / `get_record` / `get_history` / `get_admin` / `get_writer` | — | Reads |
 
 ### `lending_pool`
+
+USDC is the **Stellar Asset Contract** address passed to `initialize` (configurable issuer). Default Circle testnet USDC is `USDC:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5`. Groups are 3–5 unique members. Loan term is **30 days**. Repayment is a single lump sum of **principal + 10%**. `disburse` requires every member signature **and** an on-chain KYC flag for the leader (`set_kyc_approved`).
 
 | Function | Auth | Purpose |
 |---|---|---|
 | `initialize(admin, usdc, reputation)` | admin | Bind USDC SAC + reputation contract |
-| `create_group(leader, members[3..5])` | leader | Unique members, leader must be included |
+| `set_kyc_approved(admin, account, approved)` | admin | On-chain KYC flag used at disburse (Deliverable 3 wiring) |
+| `is_kyc_approved(account)` | — | Read KYC flag |
+| `create_group(leader, members[3..5])` | leader | Unique members; leader must be included |
 | `request_loan(group, amount)` | leader | One active loan per group |
 | `sign(group, member)` | member | Must be in the group; no double-sign |
-| `disburse(group)` | — | All signatures required; USDC pool → leader |
-| `repay(group, payer)` | payer | Pulls **exactly 110%** USDC back to the pool; +reputation |
-| `mark_default(group)` | — | Only after `disbursed_at + 30 days`; −reputation |
+| `disburse(group)` | — | All signatures + leader KYC; USDC pool → leader; `due_at = now + 30d` |
+| `repay(group, payer)` | payer | Pulls **exactly 110%** before due; marks repaid; +reputation |
+| `mark_default(group)` | — | Only after `due_at` if unpaid; −reputation |
 | `deposit` / `withdraw` | lender | Pool liquidity |
-
-USDC is the **Stellar Asset Contract** for a configurable issuer. Default Circle testnet USDC is `USDC:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5`. The e2e script mints a deployer-issued USDC SAC so the flow can run without Circle inventory; that issuer is written to `config/testnet.json`.
+| `get_group` / `get_loan` / `get_group_loan` / `get_due_amount` / `get_deposit` / `get_usdc` / `get_reputation` | — | Reads |
 
 ### `marketplace_escrow`
 
+Buyer USDC is held in the contract until release, timeout refund, or admin arbitration.
+
 | Function | Auth | Purpose |
 |---|---|---|
+| `initialize(admin, usdc)` | admin | Bind admin + USDC SAC |
 | `create_escrow(buyer, seller, amount)` | buyer | Open a trade |
 | `fund(id)` | buyer | USDC into the contract, 7-day timeout |
-| `confirm_delivery(id)` | buyer | Release to seller |
-| `refund(id, caller)` | buyer after timeout, or seller anytime | Return to buyer |
-| `dispute` / `arbitrate` | party / admin | Admin sends funds to seller or buyer |
+| `mark_shipped(id)` | seller | Funded → Shipped |
+| `confirm_delivery(id)` | buyer | From Funded or Shipped; release to seller |
+| `refund(id, caller)` | buyer after timeout (Funded/Shipped), or seller while Funded | Return to buyer |
+| `dispute(id, caller)` | buyer or seller | From Funded or Shipped |
+| `arbitrate(id, release_to_seller)` | admin | After dispute; send funds to seller or buyer |
+| `get_escrow` / `get_admin` | — | Reads |
+
+## Build and test (contracts)
+
+Prerequisites: Rust 1.84+ with target `wasm32v1-none`, [Stellar CLI](https://developers.stellar.org/docs/tools/developer-tools/cli/install-cli).
+
+```powershell
+# Unit tests for the whole workspace (lending_pool, marketplace_escrow, reputation)
+cargo test
+
+# Optimized WASM for each contract
+stellar contract build
+stellar contract optimize --wasm target/wasm32v1-none/release/lending_pool.wasm --wasm-out wasm/lending_pool.wasm
+stellar contract optimize --wasm target/wasm32v1-none/release/marketplace_escrow.wasm --wasm-out wasm/marketplace_escrow.wasm
+stellar contract optimize --wasm target/wasm32v1-none/release/reputation.wasm --wasm-out wasm/reputation.wasm
+```
+
+Hashes and sizes of the committed artifacts are in [`wasm/README.md`](wasm/README.md).
 
 ## Architecture
 
@@ -145,22 +175,21 @@ Issuer for this deploy’s USDC SAC is the deployer `GAPY77FXSZ7VXK4KIF3L4MN6LBD
 
 ## KYC / AML gate
 
-`POST /api/loans/:id/disburse` and `POST /api/anchor/withdraw` return **403** until SEP-12 reports `ACCEPTED` for that user. The contracts themselves do not enforce KYC; the API does.
+`lending_pool.disburse` fails with `KycRequired` unless `set_kyc_approved(admin, leader, true)` has been called. The backend SEP-12 gate (`POST /api/loans/:id/disburse`) is Deliverable 3 and is not part of this contract suite.
 
 A background job flags disbursed loans once `due_at` (day 30) is reached (`GET /api/loans/overdue`).
 
 ## Tests
 
-- Contract unit tests: `cargo test` (missing signatures, wrong amount, late default, unauthorized writers, escrow timeout/arbitration).
-- Wallet encryption + interest math: `cd backend && npm test`.
+- Contract unit tests: `cargo test` — every public function, including failure cases (wrong group size, missing signature, double disburse, wrong repay amount, late repay, unauthorized callers, KYC gate, escrow timeouts, disputes, `mark_shipped`).
+- Wallet encryption + interest math: `cd backend && npm test` (out of Deliverable 1).
 
 ## What is unfinished
 
+- **Backend, anchor, and SEP-12 KYC wiring** — out of Deliverable 1. On-chain `set_kyc_approved` is in place for later use.
 - **Flutter app** — the spec allowed a web demo instead; `stellar_flutter_sdk` is not in this MVP.
 - **Hosted SEP-24 settlement** — the e2e script creates a real interactive withdraw with the live anchor and prints the URL. Completing the hosted UI (bank/mobile money details) needs a browser session; the script does not fake a completed cash-out.
 - **Circle-issued USDC inventory** — e2e mints a deployer-issued USDC SAC so disbursement is a real testnet SAC transfer. Production config should point `USDC_ISSUER` at Circle’s testnet/mainnet issuer and pre-fund the pool.
-- **`cargo test` on this Windows machine** — host-side contract tests exist (including missing signatures, insufficient 110% repayment, late default, unauthorized writers, escrow timeout/arbitration) and snapshot files from earlier runs are in `contracts/*/test_snapshots`. Recompiling them here is blocked by Windows Application Control (`os error 4551`) which refuses cargo build-script executables. Prebuilt WASM in `wasm/` is what was deployed. Re-run `cargo test` on a machine without that policy.
-- **Deprecated Soroban events API** — contracts still use `env.events().publish`; SDK 23 prefers `#[contractevent]`. Behavior is unchanged.
 
 ## Contact
 

@@ -1,6 +1,11 @@
 # Rust
 target
 
+# Optimized contract WASM in /wasm is tracked for the Instawards deliverable.
+!wasm/
+!wasm/*.wasm
+!wasm/README.md
+
 # Stellar CLI
 .soroban
 .stellar

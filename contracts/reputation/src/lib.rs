@@ -1,6 +1,8 @@
 #![no_std]
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Vec};
+use soroban_sdk::{
+    contract, contracterror, contractevent, contractimpl, contracttype, Address, Env, Vec,
+};
 
 pub const REPAY_DELTA: i32 = 10;
 pub const DEFAULT_DELTA: i32 = 20;
@@ -51,6 +53,37 @@ enum DataKey {
     History(Address),
 }
 
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Initialized {
+    pub admin: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WriterSet {
+    pub writer: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RepaymentRecorded {
+    #[topic]
+    pub member: Address,
+    pub loan_id: u64,
+    pub amount: i128,
+    pub score: i32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DefaultRecorded {
+    #[topic]
+    pub member: Address,
+    pub loan_id: u64,
+    pub score: i32,
+}
+
 #[contract]
 pub struct Reputation;
 
@@ -64,6 +97,7 @@ impl Reputation {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Initialized, &true);
         env.storage().instance().extend_ttl(100_000, 100_000);
+        Initialized { admin }.publish(&env);
         Ok(())
     }
 
@@ -71,6 +105,10 @@ impl Reputation {
     pub fn set_writer(env: Env, writer: Address) -> Result<(), Error> {
         require_admin(&env)?;
         env.storage().instance().set(&DataKey::Writer, &writer);
+        WriterSet {
+            writer: writer.clone(),
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -84,7 +122,7 @@ impl Reputation {
         if amount <= 0 {
             return Err(Error::InvalidAmount);
         }
-        apply_event(
+        let score = apply_event(
             &env,
             &member,
             ReputationEvent {
@@ -95,12 +133,19 @@ impl Reputation {
                 delta: REPAY_DELTA,
             },
         );
+        RepaymentRecorded {
+            member,
+            loan_id,
+            amount,
+            score,
+        }
+        .publish(&env);
         Ok(())
     }
 
     pub fn record_default(env: Env, member: Address, loan_id: u64) -> Result<(), Error> {
         require_writer(&env)?;
-        apply_event(
+        let score = apply_event(
             &env,
             &member,
             ReputationEvent {
@@ -111,6 +156,12 @@ impl Reputation {
                 delta: -DEFAULT_DELTA,
             },
         );
+        DefaultRecorded {
+            member,
+            loan_id,
+            score,
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -188,7 +239,7 @@ fn load_record(env: &Env, member: &Address) -> ReputationRecord {
         })
 }
 
-fn apply_event(env: &Env, member: &Address, event: ReputationEvent) {
+fn apply_event(env: &Env, member: &Address, event: ReputationEvent) -> i32 {
     let mut record = load_record(env, member);
     if event.delta >= 0 {
         record.score = record.score.saturating_add(event.delta);
@@ -216,6 +267,7 @@ fn apply_event(env: &Env, member: &Address, event: ReputationEvent) {
     env.storage()
         .persistent()
         .extend_ttl(&DataKey::History(member.clone()), 100_000, 100_000);
+    record.score
 }
 
 mod test;

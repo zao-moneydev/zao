@@ -1,7 +1,7 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, token,
+    contract, contractclient, contracterror, contractevent, contractimpl, contracttype, token,
     Address, Env, Vec,
 };
 
@@ -42,6 +42,9 @@ pub enum Error {
     Overflow = 19,
     InsufficientDeposit = 20,
     InsufficientLiquidity = 21,
+    KycRequired = 22,
+    AlreadyDisbursed = 23,
+    TooLateToRepay = 24,
 }
 
 #[contracttype]
@@ -88,6 +91,92 @@ enum DataKey {
     Loan(u64),
     GroupLoan(u64),
     LenderDeposit(Address),
+    Kyc(Address),
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Initialized {
+    pub admin: Address,
+    pub usdc: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GroupCreated {
+    #[topic]
+    pub group_id: u64,
+    pub leader: Address,
+    pub size: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LoanRequested {
+    #[topic]
+    pub loan_id: u64,
+    pub group_id: u64,
+    pub principal: i128,
+    pub due_amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LoanSigned {
+    #[topic]
+    pub loan_id: u64,
+    pub member: Address,
+    pub signature_count: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LoanDisbursed {
+    #[topic]
+    pub loan_id: u64,
+    pub leader: Address,
+    pub principal: i128,
+    pub due_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LoanRepaid {
+    #[topic]
+    pub loan_id: u64,
+    pub amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LoanDefaulted {
+    #[topic]
+    pub loan_id: u64,
+    pub principal: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PoolDeposited {
+    #[topic]
+    pub lender: Address,
+    pub amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PoolWithdrawn {
+    #[topic]
+    pub lender: Address,
+    pub amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KycUpdated {
+    #[topic]
+    pub account: Address,
+    pub approved: bool,
 }
 
 #[contract]
@@ -112,7 +201,41 @@ impl LendingPool {
         env.storage().instance().set(&DataKey::NextGroupId, &1u64);
         env.storage().instance().set(&DataKey::NextLoanId, &1u64);
         env.storage().instance().extend_ttl(100_000, 100_000);
+        Initialized { admin, usdc }.publish(&env);
         Ok(())
+    }
+
+    pub fn set_kyc_approved(
+        env: Env,
+        admin: Address,
+        account: Address,
+        approved: bool,
+    ) -> Result<(), Error> {
+        require_init(&env)?;
+        admin.require_auth();
+        let stored: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        if admin != stored {
+            return Err(Error::Unauthorized);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::Kyc(account.clone()), &approved);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Kyc(account.clone()), 100_000, 100_000);
+        KycUpdated { account, approved }.publish(&env);
+        Ok(())
+    }
+
+    pub fn is_kyc_approved(env: Env, account: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Kyc(account))
+            .unwrap_or(false)
     }
 
     pub fn create_group(
@@ -124,10 +247,11 @@ impl LendingPool {
         leader.require_auth();
         validate_group(&leader, &members)?;
 
-        let id: u64 = env.storage().instance().get(&DataKey::NextGroupId).unwrap();
+        let id = next_id(&env, DataKey::NextGroupId)?;
+        let size = members.len();
         let group = Group {
             id,
-            leader,
+            leader: leader.clone(),
             members,
         };
         env.storage().persistent().set(&DataKey::Group(id), &group);
@@ -135,8 +259,12 @@ impl LendingPool {
             .persistent()
             .extend_ttl(&DataKey::Group(id), 100_000, 100_000);
         env.storage().instance().set(&DataKey::NextGroupId, &(id + 1));
-        env.events()
-            .publish((symbol_short!("grp_new"), id), group.id);
+        GroupCreated {
+            group_id: id,
+            leader,
+            size,
+        }
+        .publish(&env);
         Ok(id)
     }
 
@@ -157,7 +285,7 @@ impl LendingPool {
         }
 
         let due = due_amount(amount)?;
-        let id: u64 = env.storage().instance().get(&DataKey::NextLoanId).unwrap();
+        let id = next_id(&env, DataKey::NextLoanId)?;
         let loan = Loan {
             id,
             group_id,
@@ -174,8 +302,13 @@ impl LendingPool {
             .persistent()
             .set(&DataKey::GroupLoan(group_id), &id);
         env.storage().instance().set(&DataKey::NextLoanId, &(id + 1));
-        env.events()
-            .publish((symbol_short!("loan_req"), id), (group_id, amount));
+        LoanRequested {
+            loan_id: id,
+            group_id,
+            principal: amount,
+            due_amount: due,
+        }
+        .publish(&env);
         Ok(id)
     }
 
@@ -194,10 +327,14 @@ impl LendingPool {
         if contains(&loan.signatures, &member) {
             return Err(Error::AlreadySigned);
         }
-        loan.signatures.push_back(member);
+        loan.signatures.push_back(member.clone());
         save_loan(&env, &loan);
-        env.events()
-            .publish((symbol_short!("signed"), loan_id), loan.signatures.len());
+        LoanSigned {
+            loan_id,
+            member,
+            signature_count: loan.signatures.len(),
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -206,14 +343,19 @@ impl LendingPool {
         let group = load_group(&env, group_id)?;
         let loan_id = current_loan_id(&env, group_id).ok_or(Error::LoanNotFound)?;
         let mut loan = load_loan(&env, loan_id)?;
-        if loan.status != LoanStatus::Requested {
-            return Err(Error::LoanNotRequested);
+        match loan.status {
+            LoanStatus::Disbursed => return Err(Error::AlreadyDisbursed),
+            LoanStatus::Repaid | LoanStatus::Defaulted => return Err(Error::LoanAlreadyClosed),
+            LoanStatus::Requested => {}
         }
         if !all_signed(&group.members, &loan.signatures) {
             return Err(Error::MissingSignatures);
         }
+        if !Self::is_kyc_approved(env.clone(), group.leader.clone()) {
+            return Err(Error::KycRequired);
+        }
 
-        let usdc = usdc_client(&env);
+        let usdc = usdc_client(&env)?;
         let pool = env.current_contract_address();
         if usdc.balance(&pool) < loan.principal {
             return Err(Error::InsufficientPool);
@@ -225,8 +367,13 @@ impl LendingPool {
         loan.disbursed_at = now;
         loan.due_at = now.saturating_add(LOAN_TERM_SECONDS);
         save_loan(&env, &loan);
-        env.events()
-            .publish((symbol_short!("disburse"), loan.id), loan.principal);
+        LoanDisbursed {
+            loan_id: loan.id,
+            leader: group.leader,
+            principal: loan.principal,
+            due_at: loan.due_at,
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -236,11 +383,16 @@ impl LendingPool {
         let group = load_group(&env, group_id)?;
         let loan_id = current_loan_id(&env, group_id).ok_or(Error::LoanNotFound)?;
         let mut loan = load_loan(&env, loan_id)?;
-        if loan.status != LoanStatus::Disbursed {
-            return Err(Error::LoanNotDisbursed);
+        match loan.status {
+            LoanStatus::Repaid | LoanStatus::Defaulted => return Err(Error::LoanAlreadyClosed),
+            LoanStatus::Requested => return Err(Error::LoanNotDisbursed),
+            LoanStatus::Disbursed => {}
+        }
+        if env.ledger().timestamp() >= loan.due_at {
+            return Err(Error::TooLateToRepay);
         }
 
-        let usdc = usdc_client(&env);
+        let usdc = usdc_client(&env)?;
         let pool = env.current_contract_address();
         usdc.transfer(&payer, &pool, &loan.due_amount);
 
@@ -248,15 +400,15 @@ impl LendingPool {
         loan.repaid_at = env.ledger().timestamp();
         save_loan(&env, &loan);
 
-        let reputation = ReputationClient::new(
-            &env,
-            &env.storage().instance().get(&DataKey::Reputation).unwrap(),
-        );
+        let reputation = reputation_client(&env)?;
         for member in group.members.iter() {
             reputation.record_repayment(&member, &loan.id, &loan.due_amount);
         }
-        env.events()
-            .publish((symbol_short!("repaid"), loan.id), loan.due_amount);
+        LoanRepaid {
+            loan_id: loan.id,
+            amount: loan.due_amount,
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -277,15 +429,15 @@ impl LendingPool {
         loan.status = LoanStatus::Defaulted;
         save_loan(&env, &loan);
 
-        let reputation = ReputationClient::new(
-            &env,
-            &env.storage().instance().get(&DataKey::Reputation).unwrap(),
-        );
+        let reputation = reputation_client(&env)?;
         for member in group.members.iter() {
             reputation.record_default(&member, &loan.id);
         }
-        env.events()
-            .publish((symbol_short!("default"), loan.id), loan.principal);
+        LoanDefaulted {
+            loan_id: loan.id,
+            principal: loan.principal,
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -295,13 +447,17 @@ impl LendingPool {
         if amount <= 0 {
             return Err(Error::InvalidAmount);
         }
-        let usdc = usdc_client(&env);
+        let usdc = usdc_client(&env)?;
         usdc.transfer(&from, &env.current_contract_address(), &amount);
         let key = DataKey::LenderDeposit(from.clone());
         let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
         env.storage().persistent().set(&key, &(current + amount));
-        env.events()
-            .publish((symbol_short!("deposit"), from), amount);
+        env.storage().persistent().extend_ttl(&key, 100_000, 100_000);
+        PoolDeposited {
+            lender: from,
+            amount,
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -316,15 +472,18 @@ impl LendingPool {
         if current < amount {
             return Err(Error::InsufficientDeposit);
         }
-        let usdc = usdc_client(&env);
+        let usdc = usdc_client(&env)?;
         let pool = env.current_contract_address();
         if usdc.balance(&pool) < amount {
             return Err(Error::InsufficientLiquidity);
         }
         env.storage().persistent().set(&key, &(current - amount));
         usdc.transfer(&pool, &to, &amount);
-        env.events()
-            .publish((symbol_short!("withdraw"), to), amount);
+        PoolWithdrawn {
+            lender: to,
+            amount,
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -382,11 +541,29 @@ fn require_init(env: &Env) -> Result<(), Error> {
     }
 }
 
-fn usdc_client(env: &Env) -> token::TokenClient<'_> {
-    token::TokenClient::new(
-        env,
-        &env.storage().instance().get(&DataKey::Usdc).unwrap(),
-    )
+fn next_id(env: &Env, key: DataKey) -> Result<u64, Error> {
+    env.storage()
+        .instance()
+        .get(&key)
+        .ok_or(Error::NotInitialized)
+}
+
+fn usdc_client(env: &Env) -> Result<token::TokenClient<'_>, Error> {
+    let addr: Address = env
+        .storage()
+        .instance()
+        .get(&DataKey::Usdc)
+        .ok_or(Error::NotInitialized)?;
+    Ok(token::TokenClient::new(env, &addr))
+}
+
+fn reputation_client(env: &Env) -> Result<ReputationClient<'_>, Error> {
+    let addr: Address = env
+        .storage()
+        .instance()
+        .get(&DataKey::Reputation)
+        .ok_or(Error::NotInitialized)?;
+    Ok(ReputationClient::new(env, &addr))
 }
 
 fn load_group(env: &Env, group_id: u64) -> Result<Group, Error> {
@@ -432,8 +609,10 @@ fn validate_group(leader: &Address, members: &Vec<Address>) -> Result<(), Error>
         return Err(Error::LeaderNotMember);
     }
     for i in 0..n {
+        let left = members.get(i).ok_or(Error::InvalidGroupSize)?;
         for j in (i + 1)..n {
-            if members.get(i).unwrap() == members.get(j).unwrap() {
+            let right = members.get(j).ok_or(Error::InvalidGroupSize)?;
+            if left == right {
                 return Err(Error::DuplicateMember);
             }
         }
