@@ -8,11 +8,32 @@ function fromErr(err: unknown): string {
 }
 
 function splitName(name: string): { first_name: string; last_name: string } {
-  const parts = name.trim().split(/\s+/);
+  const parts = name.trim().split(/\s+/).filter(Boolean);
+  const first = parts[0] || "Trader";
+  const rest = parts.slice(1).join(" ");
   return {
-    first_name: parts[0] || "Trader",
-    last_name: parts.slice(1).join(" ") || "Zao",
+    first_name: first,
+    last_name: rest || (first === "Thabo" ? "Mokoena" : ""),
   };
+}
+
+function memberIdsOf(group: Group): string[] {
+  if (Array.isArray(group.memberIds)) return group.memberIds;
+  try {
+    const parsed = JSON.parse(group.member_ids || "[]");
+    return Array.isArray(parsed) ? parsed.filter((id) => typeof id === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Demo accounts share a timestamp in the email. Show only that trio, not every past run. */
+function demoPeers(me: User, users: User[]): User[] {
+  const others = users.filter((user) => user.id !== me.id);
+  const stamp = me.email.match(/\.(\d+)@zao\.local$/)?.[1];
+  if (!stamp) return others;
+  const cohort = others.filter((user) => user.email.endsWith(`.${stamp}@zao.local`));
+  return cohort.length >= 2 ? cohort : others;
 }
 
 function loanStatus(group?: Group): string {
@@ -39,7 +60,7 @@ export default function App() {
   const [apiUp, setApiUp] = useState<boolean | null>(null);
 
   const myGroups = useMemo(
-    () => groups.filter((g) => (g.memberIds ?? JSON.parse(g.member_ids || "[]")).includes(me?.id)),
+    () => (me ? groups.filter((g) => memberIdsOf(g).includes(me.id)) : []),
     [groups, me],
   );
 
@@ -339,7 +360,6 @@ function GroupStep({
   run: (label: string, work: () => Promise<void>) => Promise<void>;
   onDone: (message: string) => Promise<void>;
 }) {
-  const others = users.filter((u) => u.id !== me?.id);
   const [picked, setPicked] = useState<string[]>([]);
   if (!me) {
     return (
@@ -349,6 +369,7 @@ function GroupStep({
       </div>
     );
   }
+  const others = demoPeers(me, users);
   return (
     <div className="card">
       <h2>Form a group of 3–5</h2>
@@ -370,6 +391,7 @@ function GroupStep({
               }
             />
             {user.name}
+            <span className="quiet">{user.email}</span>
           </label>
         ))}
       </div>
@@ -740,7 +762,7 @@ function CashStep({
       <label htmlFor="withdraw">Cash-out amount (USDC)</label>
       <input id="withdraw" value={amount} onChange={(e) => setAmount(e.target.value)} />
       <button
-        className="ghost"
+        className="primary"
         data-testid="cash-out"
         disabled={busy}
         onClick={() =>
