@@ -52,15 +52,23 @@ async function main() {
     printStep({ name: "lender USDC trustline", hash: trust, extra: { lender: lender.publicKey() } });
   }
 
-  printStep({ name: "mint USDC to lender (deployer-issued SAC)" });
-  const mint = await invoke({
-    contractId: cfg.usdcContractId,
-    method: "mint",
-    args: [lender.publicKey(), poolLiquidity],
-    source: deployer,
-  });
-  steps.push({ name: "mint USDC to lender", ...mint, extra: { lender: lender.publicKey() } });
-  printStep(steps[steps.length - 1]);
+  const issuer = (cfg.usdcAsset.split(":")[1] ?? "").trim();
+  if (issuer && issuer === deployer.publicKey()) {
+    printStep({ name: "mint USDC to lender (deployer-issued SAC)" });
+    const mint = await invoke({
+      contractId: cfg.usdcContractId,
+      method: "mint",
+      args: [lender.publicKey(), poolLiquidity],
+      source: deployer,
+    });
+    steps.push({ name: "mint USDC to lender", ...mint, extra: { lender: lender.publicKey() } });
+    printStep(steps[steps.length - 1]);
+  } else {
+    printStep({
+      name: "skip mint — pool asset is the anchor's SRT/USDC (use npm run demo:payout to fund via SEP-24)",
+      extra: { usdcAsset: cfg.usdcAsset },
+    });
+  }
 
   const deposit = await invoke({
     contractId: cfg.lendingPoolContractId,
@@ -112,6 +120,15 @@ async function main() {
     steps.push({ name: `sign by ${member.publicKey()}`, ...signed });
     printStep(steps[steps.length - 1]);
   }
+
+  const kycFlag = await invoke({
+    contractId: cfg.lendingPoolContractId,
+    method: "set_kyc_approved",
+    args: [deployer.publicKey(), leader.publicKey(), true],
+    source: deployer,
+  });
+  steps.push({ name: "set_kyc_approved(leader)", ...kycFlag });
+  printStep(steps[steps.length - 1]);
 
   printStep({ name: "SEP-10 + SEP-12 KYC for the group leader (testanchor.stellar.org)" });
   const token = await sep10(leader);

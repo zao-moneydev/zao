@@ -5,6 +5,7 @@ import {
   Contract,
   Horizon,
   Keypair,
+  Memo,
   Operation,
   TransactionBuilder,
   nativeToScVal,
@@ -13,6 +14,7 @@ import {
   xdr,
 } from "@stellar/stellar-sdk";
 import { config, expertTx, loadTestnetConfig } from "./config.ts";
+import type { WithdrawPayment } from "./sep.ts";
 
 const horizon = new Horizon.Server(config.horizonUrl);
 const server = new rpc.Server(config.rpcUrl, { allowHttp: false });
@@ -63,6 +65,60 @@ export async function fundAccount(publicKey: string): Promise<void> {
     }
   }
   throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+function toMemo(memo: string, memoType?: string): Memo {
+  const kind = (memoType ?? "text").toLowerCase();
+  if (kind === "id") return Memo.id(memo);
+  if (kind === "hash" || kind === "return") {
+    const buf = /^[0-9a-fA-F]{64}$/.test(memo)
+      ? Buffer.from(memo, "hex")
+      : Buffer.from(memo, "base64");
+    return kind === "return" ? Memo.return(buf) : Memo.hash(buf);
+  }
+  return Memo.text(memo.slice(0, 28));
+}
+
+/** Classic payment (SEP-24 withdraw) to the anchor with the required memo. */
+export async function submitClassicPayment(opts: {
+  source: Keypair;
+  destination: string;
+  amount: string;
+  asset?: Asset;
+  memo?: string;
+  memoType?: string;
+}): Promise<{ hash: string; expert: string }> {
+  const asset = opts.asset ?? usdcAsset();
+  const account = await horizon.loadAccount(opts.source.publicKey());
+  const builder = new TransactionBuilder(account, {
+    fee: String(Number(BASE_FEE) * 10),
+    networkPassphrase: config.networkPassphrase,
+  }).addOperation(
+    Operation.payment({
+      destination: opts.destination,
+      asset,
+      amount: opts.amount,
+    }),
+  );
+  if (opts.memo) builder.addMemo(toMemo(opts.memo, opts.memoType));
+  const tx = builder.setTimeout(60).build();
+  tx.sign(opts.source);
+  const result = await horizon.submitTransaction(tx);
+  return { hash: result.hash, expert: expertTx(result.hash) };
+}
+
+export async function sendWithdrawPayment(
+  source: Keypair,
+  payment: WithdrawPayment,
+): Promise<{ hash: string; expert: string }> {
+  return submitClassicPayment({
+    source,
+    destination: payment.destination,
+    amount: payment.amount,
+    asset: new Asset(payment.assetCode, payment.assetIssuer),
+    memo: payment.memo,
+    memoType: payment.memoType,
+  });
 }
 
 export async function ensureTrustline(kp: Keypair, asset = usdcAsset()): Promise<string | null> {

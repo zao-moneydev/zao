@@ -119,11 +119,32 @@ cargo test
 stellar contract build
 cd backend
 npm install
+npx playwright install chromium
 npm test
-npm run deploy          # writes config/testnet.json
-npm run e2e             # live testnet flow + stellar.expert links
+npm run deploy:testnet  # deploys wasm/ to testnet, writes config/testnet.json
+npm run demo:payout     # group → disburse → SEP-24 payment to the anchor
 npm run dev             # API on :3001
 ```
+
+### Deliverable 2 — testnet anchor payout
+
+The lending pool is initialized with the **SRT/USDC credit asset advertised in the anchor `stellar.toml`** (default `testanchor.stellar.org`, asset `SRT`). Accounts are funded with Friendbot and receive trustlines automatically.
+
+```powershell
+cd backend
+npm run deploy:testnet
+npm run demo:payout
+```
+
+`demo:payout` creates a 3-member group, has every member sign, calls `set_kyc_approved` for the leader, disburses, starts a SEP-24 withdraw, drives the hosted page with Playwright, pays the anchor’s `withdraw_anchor_account` with the required memo, and writes hashes to `evidence/deliverable2.md`.
+
+API:
+
+- `POST /api/anchor/withdraw` `{ "amount": "2" }` — SEP-10 + SEP-24 interactive withdraw; returns `{ id, url }`
+- `GET /api/anchor/transactions/:id` — poll SEP-24 status
+- `POST /api/anchor/withdraw/:id/pay` — once status is `pending_user_transfer_start`, submit the Stellar payment and poll until `completed`
+
+Secrets stay in `.env` (see `.env.example`). Logs never print Stellar secrets or JWTs.
 
 ```powershell
 cd client
@@ -162,16 +183,16 @@ On-chain reputation after repay: **10** for each of the three members. SEP-12 re
 
 ## Testnet contract IDs
 
-Last deploy (`2026-11-11T16:22:26Z`) wrote `config/testnet.json`:
+Last deploy (`2026-11-12T06:50:12Z`) wrote `config/testnet.json`. Pool asset is testanchor **SRT** (`GCDNJUBQSX7AJWLJACMJ7I4BC3Z47BQUTMHEICZLE6MU4KQBRYG5JY6B`).
 
 | Contract | ID | Explorer |
 |---|---|---|
-| USDC SAC | `CDLW5RSVPQ3LJ7G4UJZWF65I34SNH7F7P5HTXNEP5UFFKOPIMLFNX7ZD` | [stellar.expert](https://stellar.expert/explorer/testnet/contract/CDLW5RSVPQ3LJ7G4UJZWF65I34SNH7F7P5HTXNEP5UFFKOPIMLFNX7ZD) |
-| reputation | `CDLCQNL57LOB5LKZLCOTUOZ63CA46NPG3CJ2QJWQF6QYFLRFCEPZM6VF` | [stellar.expert](https://stellar.expert/explorer/testnet/contract/CDLCQNL57LOB5LKZLCOTUOZ63CA46NPG3CJ2QJWQF6QYFLRFCEPZM6VF) |
-| lending_pool | `CAKX3TYTANV6IQIWFNRRIFWGBTBEKITJNUIBVPK73QMLG7IFUIHQFLYE` | [stellar.expert](https://stellar.expert/explorer/testnet/contract/CAKX3TYTANV6IQIWFNRRIFWGBTBEKITJNUIBVPK73QMLG7IFUIHQFLYE) |
-| marketplace_escrow | `CCFXRSI6O3LB7JCE3HAVWFELMP5IWNV3QZIWVY7LLBQ5R575NRQMGFUZ` | [stellar.expert](https://stellar.expert/explorer/testnet/contract/CCFXRSI6O3LB7JCE3HAVWFELMP5IWNV3QZIWVY7LLBQ5R575NRQMGFUZ) |
+| SRT SAC | `CBZVLMD5DBKIFSVU23WAVMJD25IRUBWCVAXGURPUPMB2CUNFBQN742UV` | [stellar.expert](https://stellar.expert/explorer/testnet/contract/CBZVLMD5DBKIFSVU23WAVMJD25IRUBWCVAXGURPUPMB2CUNFBQN742UV) |
+| reputation | `CCIIUDB47LYE6HJCRURMFJ4XOU7XARE2LSSPZOJNQA2IEZMY7E6DW2RE` | [stellar.expert](https://stellar.expert/explorer/testnet/contract/CCIIUDB47LYE6HJCRURMFJ4XOU7XARE2LSSPZOJNQA2IEZMY7E6DW2RE) |
+| lending_pool | `CBZGLCLXSEEYN44RKFIW5KDGTSCV4X5TW5DRJKRF5UXV5VPKPD4UZAEX` | [stellar.expert](https://stellar.expert/explorer/testnet/contract/CBZGLCLXSEEYN44RKFIW5KDGTSCV4X5TW5DRJKRF5UXV5VPKPD4UZAEX) |
+| marketplace_escrow | `CDOASBD2VSNG3SO6SF4OQHVGLY3EAA57JQHF34U4DW3MAMJB6UNUZMMQ` | [stellar.expert](https://stellar.expert/explorer/testnet/contract/CDOASBD2VSNG3SO6SF4OQHVGLY3EAA57JQHF34U4DW3MAMJB6UNUZMMQ) |
 
-Issuer for this deploy’s USDC SAC is the deployer `GAPY77FXSZ7VXK4KIF3L4MN6LBDIDMAPNH2BH76R5SZXGUBFQMAFFHFZ` (not Circle inventory). Redeploy with `cd backend && npm run deploy` to rotate IDs.
+Deliverable 2 payout evidence (SEP-24 **completed**): [`evidence/deliverable2.md`](evidence/deliverable2.md). Payment to the anchor: [`82149e84…`](https://stellar.expert/explorer/testnet/tx/82149e84e87c3b09b38339863bcee656597e351d1d195d819f52e1c81dce3e5f).
 
 ## KYC / AML gate
 
@@ -182,14 +203,12 @@ A background job flags disbursed loans once `due_at` (day 30) is reached (`GET /
 ## Tests
 
 - Contract unit tests: `cargo test` — every public function, including failure cases (wrong group size, missing signature, double disburse, wrong repay amount, late repay, unauthorized callers, KYC gate, escrow timeouts, disputes, `mark_shipped`).
-- Wallet encryption + interest math: `cd backend && npm test` (out of Deliverable 1).
+- Wallet encryption, interest math, SEP-10 signing, SEP-24 poll/payment builders: `cd backend && npm test` (HTTP is mocked in unit tests).
 
 ## What is unfinished
 
-- **Backend, anchor, and SEP-12 KYC wiring** — out of Deliverable 1. On-chain `set_kyc_approved` is in place for later use.
+- **KYC gate UI / guided web demo** — Deliverable 3. On-chain `set_kyc_approved` is used by `demo:payout`.
 - **Flutter app** — the spec allowed a web demo instead; `stellar_flutter_sdk` is not in this MVP.
-- **Hosted SEP-24 settlement** — the e2e script creates a real interactive withdraw with the live anchor and prints the URL. Completing the hosted UI (bank/mobile money details) needs a browser session; the script does not fake a completed cash-out.
-- **Circle-issued USDC inventory** — e2e mints a deployer-issued USDC SAC so disbursement is a real testnet SAC transfer. Production config should point `USDC_ISSUER` at Circle’s testnet/mainnet issuer and pre-fund the pool.
 
 ## Contact
 

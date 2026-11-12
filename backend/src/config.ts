@@ -29,8 +29,9 @@ export const config = {
   adminEmail: process.env.ADMIN_USER_EMAIL ?? "admin@zao.local",
   anchorHomeDomain:
     process.env.ANCHOR_HOME_DOMAIN ?? "https://testanchor.stellar.org",
-  anchorAssetCode: process.env.ANCHOR_ASSET_CODE ?? "USDC",
-  e2eMintUsdc: (process.env.E2E_MINT_USDC ?? "true") === "true",
+  /** Credit asset the configured anchor lists (SRT on testanchor; USDC if present). */
+  anchorAssetCode: process.env.ANCHOR_ASSET_CODE ?? "SRT",
+  e2eMintUsdc: (process.env.E2E_MINT_USDC ?? "false") === "true",
 };
 
 export type TestnetConfig = {
@@ -42,6 +43,9 @@ export type TestnetConfig = {
   escrowContractId: string;
   deployerPublicKey: string;
   deployedAt?: string;
+  anchorHomeDomain?: string;
+  assetCode?: string;
+  assetIssuer?: string;
 };
 
 export function loadTestnetConfig(): TestnetConfig {

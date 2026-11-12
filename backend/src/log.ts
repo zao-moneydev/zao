@@ -1,10 +1,15 @@
 const SECRET_RE = /(secret|seed|private|encrypted|token|authorization|password)/i;
 
+function redactSecrets(value: string): string {
+  return value
+    .replace(/\bS[A-Z2-7]{55}\b/g, "[REDACTED_SECRET]")
+    .replace(/Bearer\s+[A-Za-z0-9._-]+/gi, "Bearer [REDACTED]")
+    .replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9._-]+/g, "[REDACTED_JWT]");
+}
+
 function sanitize(value: unknown): unknown {
   if (typeof value === "string") {
-    if (value.startsWith("S") && value.length === 56) return "[REDACTED_SECRET]";
-    if (value.length > 40 && value.includes(":")) return "[REDACTED]";
-    return value;
+    return redactSecrets(value);
   }
   if (Array.isArray(value)) return value.map(sanitize);
   if (value && typeof value === "object") {

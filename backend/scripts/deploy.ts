@@ -1,8 +1,9 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, writeFileSync, appendFileSync, readFileSync, copyFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync, appendFileSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { Keypair } from "@stellar/stellar-sdk";
 import { config, ROOT, type TestnetConfig } from "../src/config.ts";
+import { loadToml, pickAnchorAsset } from "../src/sep.ts";
 import { fundAccount } from "../src/stellar.ts";
 import { log } from "../src/log.ts";
 
@@ -19,25 +20,24 @@ function run(bin: string, args: string[], input?: string): string {
 }
 
 function stellar(args: string[]): string {
-  return run("stellar", args);
+  try {
+    return run("stellar", args);
+  } catch (err) {
+    const extra =
+      err && typeof err === "object" && "stderr" in err
+        ? String((err as { stderr?: string }).stderr)
+        : "";
+    const safe = args.map((a) => (/^S[A-Z2-7]{55}$/.test(a) ? "[REDACTED_SECRET]" : a));
+    throw new Error(`stellar ${safe.join(" ")} failed: ${extra || String(err)}`);
+  }
 }
 
 function wasmPath(name: string): string {
-  const dirs = [
-    wasmDir,
-    resolve(ROOT, "target", "wasm32v1-none", "release"),
-  ];
-  if (process.env.CARGO_TARGET_DIR) {
-    dirs.push(resolve(process.env.CARGO_TARGET_DIR, "wasm32v1-none", "release"));
-  }
-  const path = dirs.map((dir) => resolve(dir, `${name}.wasm`)).find((p) => existsSync(p));
-  if (!path) {
-    throw new Error(`missing ${name}.wasm — run stellar contract build`);
-  }
-  mkdirSync(wasmDir, { recursive: true });
   const pinned = resolve(wasmDir, `${name}.wasm`);
-  if (path !== pinned) {
-    copyFileSync(path, pinned);
+  if (!existsSync(pinned)) {
+    throw new Error(
+      `missing wasm/${name}.wasm — Deliverable 1 optimized artifacts are required`,
+    );
   }
   return pinned;
 }
@@ -118,35 +118,48 @@ export async function deployTestnet(): Promise<TestnetConfig> {
   const deployer = await ensureDeployer();
   const source = deployer.secret();
 
-  const haveWasm = ["reputation", "lending_pool", "marketplace_escrow"].every((name) =>
-    existsSync(resolve(wasmDir, `${name}.wasm`)),
-  );
-  if (haveWasm) {
-    log.info("using existing wasm/ artifacts");
-  } else {
-    log.info("building contracts");
-    stellar(["contract", "build"]);
+  for (const name of ["reputation", "lending_pool", "marketplace_escrow"]) {
+    wasmPath(name);
   }
+  log.info("using optimized wasm/ artifacts");
 
-  const usdcAsset = config.e2eMintUsdc
-    ? `${config.usdcAssetCode}:${deployer.publicKey()}`
-    : `${config.usdcAssetCode}:${config.usdcIssuer}`;
+  const toml = await loadToml();
+  const asset = pickAnchorAsset(toml);
+  const usdcAsset = `${asset.code}:${asset.issuer}`;
+  log.info("anchor asset from stellar.toml", {
+    code: asset.code,
+    issuer: asset.issuer,
+    home: config.anchorHomeDomain,
+  });
 
-  log.info("deploying USDC Stellar Asset Contract", { usdcAsset });
-  const usdcOut = stellar([
-    "contract",
-    "asset",
-    "deploy",
-    "--asset",
-    usdcAsset,
-    "--source-account",
-    source,
-    "--network",
-    "testnet",
-  ]);
-  const usdcContractId = lastNonEmptyLine(usdcOut);
+  log.info("resolving Stellar Asset Contract for the anchor asset", {
+    code: asset.code,
+    issuer: asset.issuer,
+  });
+  let usdcContractId = lastNonEmptyLine(
+    stellar(["contract", "id", "asset", "--asset", usdcAsset, "--network", "testnet"]),
+  );
+  try {
+    const usdcOut = stellar([
+      "contract",
+      "asset",
+      "deploy",
+      "--asset",
+      usdcAsset,
+      "--source-account",
+      source,
+      "--network",
+      "testnet",
+    ]);
+    const deployed = lastNonEmptyLine(usdcOut);
+    if (deployed.startsWith("C")) usdcContractId = deployed;
+  } catch (err) {
+    const msg = String(err);
+    if (!/ExistingValue|already exists/i.test(msg)) throw err;
+    log.info("SAC already on-network, using derived contract id");
+  }
   if (!usdcContractId.startsWith("C")) {
-    throw new Error(`USDC SAC deploy failed:\n${usdcOut}`);
+    throw new Error(`could not resolve SAC id for ${asset.code}`);
   }
 
   const reputationContractId = deployWasm(wasmPath("reputation"), source, "zao-reputation");
@@ -180,6 +193,9 @@ export async function deployTestnet(): Promise<TestnetConfig> {
     escrowContractId,
     deployerPublicKey: deployer.publicKey(),
     deployedAt: new Date().toISOString(),
+    anchorHomeDomain: config.anchorHomeDomain,
+    assetCode: asset.code,
+    assetIssuer: asset.issuer,
   };
   mkdirSync(resolve(ROOT, "config"), { recursive: true });
   writeFileSync(resolve(ROOT, "config", "testnet.json"), JSON.stringify(cfg, null, 2) + "\n");

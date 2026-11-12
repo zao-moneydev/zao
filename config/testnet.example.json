@@ -1,10 +1,13 @@
 {
   "network": "testnet",
-  "usdcAsset": "USDC:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+  "usdcAsset": "SRT:GCDNJUBQSX7AJWLJACMJ7I4BC3Z47BQUTMHEICZLE6MU4KQBRYG5JY6B",
   "usdcContractId": "",
   "reputationContractId": "",
   "lendingPoolContractId": "",
   "escrowContractId": "",
   "deployerPublicKey": "",
-  "deployedAt": ""
+  "deployedAt": "",
+  "anchorHomeDomain": "https://testanchor.stellar.org",
+  "assetCode": "SRT",
+  "assetIssuer": "GCDNJUBQSX7AJWLJACMJ7I4BC3Z47BQUTMHEICZLE6MU4KQBRYG5JY6B"
 }

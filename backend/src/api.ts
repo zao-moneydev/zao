@@ -12,6 +12,10 @@ import {
   sep24Deposit,
   sep24Transaction,
   sep24Withdraw,
+  buildWithdrawPayment,
+  pollSep24Transaction,
+  resolveAnchorAsset,
+  unwrapSep24Transaction,
   type KycFields,
 } from "./sep.ts";
 import {
@@ -21,6 +25,7 @@ import {
   fundAccount,
   invoke,
   readContract,
+  sendWithdrawPayment,
   toStroops,
 } from "./stellar.ts";
 import {
@@ -113,6 +118,7 @@ const CONTRACT_MESSAGES: Record<number, string> = {
   18: "It is too early to mark this loan as defaulted.",
   20: "Not enough deposited to withdraw.",
   21: "The pool is still used by an open loan.",
+  22: "The group leader is not KYC-approved on-chain.",
 };
 
 function publicError(err: unknown): { status: number; message: string } {
@@ -812,23 +818,82 @@ api.post(
   "/anchor/withdraw",
   asyncHandler(async (req, res) => {
     const me = userByToken(req);
-    requireKyc(me, "cash-out");
     const body = z.object({ amount: z.string() }).parse(req.body);
     const kp = keypairFromEncrypted(me.secret_enc);
     const token = await sep10(kp);
+    const asset = await resolveAnchorAsset();
     const withdraw = await sep24Withdraw({
       token,
       account: me.public_key,
       amount: body.amount,
+      assetCode: asset.code,
     });
     db.prepare(
       `INSERT INTO anchor_txs (id, user_id, kind, status, url, created_at) VALUES (?, ?, 'withdraw', ?, ?, ?)`,
     ).run(withdraw.id, me.id, withdraw.type, withdraw.url, Date.now());
+    log.info("SEP-24 withdraw started", { id: withdraw.id, account: me.public_key });
     res.json({
       id: withdraw.id,
       url: withdraw.url,
       type: withdraw.type,
-      note: "Open the interactive URL to complete cash-out with the anchor. Settlement is on-chain; this API does not mock it.",
+      asset: `${asset.code}:${asset.issuer}`,
+      note: "Open the interactive URL, then POST /anchor/withdraw/:id/pay once the anchor reports pending_user_transfer_start.",
+    });
+  }),
+);
+
+api.post(
+  "/anchor/withdraw/:id/pay",
+  asyncHandler(async (req, res) => {
+    const me = userByToken(req);
+    const id = routeParam(req, "id");
+    const kp = keypairFromEncrypted(me.secret_enc);
+    const token = await sep10(kp);
+    const asset = await resolveAnchorAsset();
+    const pending = await pollSep24Transaction({
+      token,
+      id,
+      until: ["pending_user_transfer_start"],
+      timeoutMs: 15_000,
+      intervalMs: 2_000,
+    });
+    const payment = buildWithdrawPayment(pending, {
+      amount: pending.amount_in ?? "1",
+      assetCode: asset.code,
+      assetIssuer: asset.issuer,
+    });
+    await ensureTrustline(kp);
+    const sent = await sendWithdrawPayment(kp, payment);
+    log.info("SEP-24 withdraw payment submitted", {
+      id,
+      hash: sent.hash,
+      destination: payment.destination,
+    });
+    let finalStatus = pending.status;
+    let finalTx = pending;
+    try {
+      finalTx = await pollSep24Transaction({
+        token,
+        id,
+        until: ["completed"],
+        timeoutMs: 120_000,
+        intervalMs: 4_000,
+      });
+      finalStatus = finalTx.status;
+    } catch (err) {
+      log.error("SEP-24 did not reach completed after payment", { id, err: String(err) });
+      finalTx = unwrapSep24Transaction(await sep24Transaction(token, id));
+      finalStatus = finalTx.status;
+    }
+    db.prepare("UPDATE anchor_txs SET status = ? WHERE id = ?").run(finalStatus, id);
+    res.json({
+      id,
+      payment: sent,
+      destination: payment.destination,
+      amount: payment.amount,
+      memo: payment.memo,
+      status: finalStatus,
+      transaction: finalTx,
     });
   }),
 );
@@ -856,8 +921,13 @@ api.get(
   "/anchor/transactions/:id",
   asyncHandler(async (req, res) => {
     const me = userByToken(req);
+    const id = routeParam(req, "id");
     const token = await sep10(keypairFromEncrypted(me.secret_enc));
-    const tx = await sep24Transaction(token, routeParam(req, "id"));
+    const tx = await sep24Transaction(token, id);
+    const inner = unwrapSep24Transaction(tx);
+    if (inner.status) {
+      db.prepare("UPDATE anchor_txs SET status = ? WHERE id = ?").run(inner.status, id);
+    }
     res.json(tx);
   }),
 );
