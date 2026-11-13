@@ -278,21 +278,6 @@ api.post(
 );
 
 api.post(
-  "/demo/start",
-  asyncHandler(async (_req, res) => {
-    const stamp = Date.now();
-    const leader = await createUser("Thabo", `thabo.${stamp}@zao.local`);
-    const memberB = await createUser("Lerato", `lerato.${stamp}@zao.local`);
-    const memberC = await createUser("Sipho", `sipho.${stamp}@zao.local`);
-    res.status(201).json({
-      token: leader.token,
-      leader: leader.user,
-      members: [leader.user, memberB.user, memberC.user],
-    });
-  }),
-);
-
-api.post(
   "/users/login",
   asyncHandler(async (req, res) => {
     const body = z.object({ email: z.string().email() }).parse(req.body);

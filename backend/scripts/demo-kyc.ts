@@ -230,10 +230,24 @@ async function main() {
     webBase = await waitFor("http://127.0.0.1:5173", 45_000);
   }
 
-  const demo = await apiJson<{ token: string; leader: { id: string; publicKey: string; email: string }; members: Array<{ id: string; name: string }> }>(
-    "/api/demo/start",
-    { method: "POST" },
+  const stamp = Date.now();
+  const leaderRes = await apiJson<{ token: string; user: { id: string; publicKey: string; email: string; name: string } }>(
+    "/api/users/register",
+    { method: "POST", body: JSON.stringify({ name: "Thabo", email: `thabo.${stamp}@zao.local` }) },
   );
+  const memberB = await apiJson<{ user: { id: string; name: string } }>("/api/users/register", {
+    method: "POST",
+    body: JSON.stringify({ name: "Lerato", email: `lerato.${stamp}@zao.local` }),
+  });
+  const memberC = await apiJson<{ user: { id: string; name: string } }>("/api/users/register", {
+    method: "POST",
+    body: JSON.stringify({ name: "Sipho", email: `sipho.${stamp}@zao.local` }),
+  });
+  const demo = {
+    token: leaderRes.token,
+    leader: leaderRes.user,
+    members: [leaderRes.user, memberB.user, memberC.user],
+  };
   const token = demo.token;
   const others = demo.members.filter((m) => m.id !== demo.leader.id);
   printStep({

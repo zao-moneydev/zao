@@ -47,10 +47,6 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ email }),
     }),
-  demoStart: () =>
-    request<{ token: string; leader: User; members: User[] }>("/api/demo/start", {
-      method: "POST",
-    }),
   me: () => request<{ user: User }>("/api/users/me"),
   users: () => request<{ users: User[] }>("/api/users"),
   createGroup: (memberIds: string[]) =>

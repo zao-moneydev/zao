@@ -253,28 +253,14 @@ function WalletStep({
   onAuth: (user: User, token: string) => Promise<void>;
   run: (label: string, work: () => Promise<void>) => Promise<void>;
 }) {
-  const [name, setName] = useState("Thabo");
-  const [email, setEmail] = useState("thabo@zao.local");
+  const [name, setName] = useState("");
+  const [email, setEmail] = useState("");
   return (
     <div className="card">
       <h2>Get a wallet</h2>
       <p className="muted">
-        We create a Stellar account for you and fund it on testnet. You never see the secret key.
+        Create your own Stellar account. We fund it on testnet and keep the secret for you.
       </p>
-      <button
-        className="primary"
-        data-testid="demo-start"
-        disabled={busy}
-        onClick={() =>
-          run("creating 3 demo traders", async () => {
-            const res = await api.demoStart();
-            await onAuth(res.leader, res.token);
-          })
-        }
-      >
-        Try the demo (creates Thabo, Lerato and Sipho)
-      </button>
-      <p className="divider">or create your own</p>
       <div className="row">
         <div>
           <label htmlFor="name">Your name</label>
@@ -373,9 +359,9 @@ function GroupStep({
   return (
     <div className="card">
       <h2>Form a group of 3–5</h2>
-      <p className="muted">You are the leader. Tick at least two friends. If you used the demo, pick Lerato and Sipho.</p>
+      <p className="muted">You are the leader. Tick at least two other people who already have wallets.</p>
       {others.length === 0 && (
-        <p className="muted">No other wallets yet. Go back and tap “Try the demo”, or create two more wallets.</p>
+        <p className="muted">No other wallets yet. Create two more accounts, then come back and tick them.</p>
       )}
       <div className="members">
         {others.map((user) => (

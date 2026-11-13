@@ -165,7 +165,7 @@ npm run dev             # demo on :5173, proxies /api to the backend
 
 ## Demo script (web)
 
-1. **Try the demo** (Thabo, Lerato, Sipho — each gets a funded invisible testnet wallet).
+1. **Create a wallet** with your own name and email. Create two more people the same way.
 2. Form a group of 3. Request a loan (default 2). **Everyone signs**.
 3. **KYC & pay**: disburse is disabled with the gate reason while status is `NEEDS_INFO`.
 4. Submit the KYC form. When the anchor reports `ACCEPTED`, the backend calls `set_kyc_approved`.

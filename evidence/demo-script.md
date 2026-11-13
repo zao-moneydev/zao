@@ -1,12 +1,12 @@
 # Deliverable 3 — 2–3 minute screen-recording script
 
-Talk at a steady pace. The web demo is `http://localhost:5173` with `cd backend && npm run dev` and `cd client && npm run dev` already running. Use **Try the demo** so Thabo, Lerato and Sipho exist.
+Talk at a steady pace. The web demo is `http://localhost:5173` with `cd backend && npm run dev` and `cd client && npm run dev` already running. Create three wallets yourself: Thabo, Lerato, and Sipho.
 
 **0:00–0:20 — Setup**  
 “Zao is group micro-lending on Stellar testnet. Three traders share a loan. The pool only pays the leader after every member signs **and** KYC/AML passes — both in the API and in the `lending_pool` contract.”
 
 **0:20–0:40 — Wallet and group**  
-Click **Try the demo**, then **2. Group**. Tick Lerato and Sipho. Click **Create group**.  
+Create Thabo’s wallet, then sign out and create Lerato and Sipho. Sign back in as Thabo. **2. Group**. Tick Lerato and Sipho. Click **Create group**.  
 “Each person got an invisible Stellar wallet. The group is now on-chain.”
 
 **0:40–1:00 — Apply and sign**  
