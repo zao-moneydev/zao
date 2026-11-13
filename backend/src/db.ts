@@ -1,7 +1,7 @@
 import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { DatabaseSync, type StatementSync } from "node:sqlite";
+import { DatabaseSync, type SQLInputValue, type StatementSync } from "node:sqlite";
 import postgres from "postgres";
 import { config } from "./config.ts";
 
@@ -116,6 +116,10 @@ function asRowId(value: unknown): number {
   return 0;
 }
 
+function sqliteArgs(params: SqlValue[]): SQLInputValue[] {
+  return params.map((value) => (typeof value === "boolean" ? Number(value) : value));
+}
+
 function createSqlite(): Db {
   const dir = process.env.VERCEL
     ? "/tmp"
@@ -128,13 +132,13 @@ function createSqlite(): Db {
 
   const wrap = (stmt: StatementSync): Statement => ({
     async get(...params) {
-      return stmt.get(...params);
+      return stmt.get(...sqliteArgs(params));
     },
     async all(...params) {
-      return stmt.all(...params) as unknown[];
+      return stmt.all(...sqliteArgs(params)) as unknown[];
     },
     async run(...params) {
-      const result = stmt.run(...params);
+      const result = stmt.run(...sqliteArgs(params));
       return {
         lastInsertRowid: asRowId(result.lastInsertRowid),
         changes: Number(result.changes),

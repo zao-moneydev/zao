@@ -71,10 +71,10 @@ function toMemo(memo: string, memoType?: string): Memo {
   const kind = (memoType ?? "text").toLowerCase();
   if (kind === "id") return Memo.id(memo);
   if (kind === "hash" || kind === "return") {
-    const buf = /^[0-9a-fA-F]{64}$/.test(memo)
-      ? Buffer.from(memo, "hex")
-      : Buffer.from(memo, "base64");
-    return kind === "return" ? Memo.return(buf) : Memo.hash(buf);
+    const hex = /^[0-9a-fA-F]{64}$/.test(memo)
+      ? memo
+      : Buffer.from(memo, "base64").toString("hex");
+    return kind === "return" ? Memo.return(hex) : Memo.hash(hex);
   }
   return Memo.text(memo.slice(0, 28));
 }
