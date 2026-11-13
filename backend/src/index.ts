@@ -1,3 +1,5 @@
+import { existsSync } from "node:fs";
+import { resolve } from "node:path";
 import express from "express";
 import cors from "cors";
 import { api } from "./api.ts";
@@ -18,22 +20,36 @@ app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 app.use("/api", api);
 
-app.get("/", (_req, res) => {
-  res.json({
-    name: "Zao",
-    docs: "/api/health",
+const publicDir = resolve(process.cwd(), "public");
+const indexHtml = resolve(publicDir, "index.html");
+if (existsSync(indexHtml)) {
+  app.use(express.static(publicDir));
+  app.use((req, res, next) => {
+    if (req.method !== "GET" && req.method !== "HEAD") return next();
+    if (req.path.startsWith("/api")) return next();
+    res.sendFile(indexHtml);
   });
-});
-
-startLoanMonitor(60_000);
-
-app.listen(config.port, () => {
-  const cfg = loadTestnetConfig();
-  log.info("zao backend listening", {
-    port: config.port,
-    network: config.network,
-    anchor: config.anchorHomeDomain,
-    lendingPool: cfg.lendingPoolContractId || "(not deployed)",
-    db: dbDriver,
+} else {
+  app.get("/", (_req, res) => {
+    res.json({
+      name: "Zao",
+      docs: "/api/health",
+    });
   });
-});
+}
+
+export default app;
+
+if (!process.env.VERCEL) {
+  startLoanMonitor(60_000);
+  app.listen(config.port, () => {
+    const cfg = loadTestnetConfig();
+    log.info("zao backend listening", {
+      port: config.port,
+      network: config.network,
+      anchor: config.anchorHomeDomain,
+      lendingPool: cfg.lendingPoolContractId || "(not deployed)",
+      db: dbDriver,
+    });
+  });
+}

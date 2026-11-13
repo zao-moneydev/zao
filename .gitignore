@@ -15,6 +15,7 @@ node_modules
 dist
 client/dist
 backend/data
+backend/public
 *.db
 
 # Secrets — never commit

@@ -117,7 +117,9 @@ function asRowId(value: unknown): number {
 }
 
 function createSqlite(): Db {
-  const dir = resolve(dirname(fileURLToPath(import.meta.url)), "..", "data");
+  const dir = process.env.VERCEL
+    ? "/tmp"
+    : resolve(dirname(fileURLToPath(import.meta.url)), "..", "data");
   mkdirSync(dir, { recursive: true });
   const sqlite = new DatabaseSync(resolve(dir, "zao.db"));
   sqlite.exec("PRAGMA journal_mode = WAL;");
