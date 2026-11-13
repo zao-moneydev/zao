@@ -1,7 +1,0 @@
-{
-  "functions": {
-    "src/index.ts": {
-      "includeFiles": "public/**"
-    }
-  }
-}
